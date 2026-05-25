@@ -1,40 +1,12 @@
 """E2B sandbox helpers for the coding-agent RL demo.
 
-This file is the SANDBOX BACKEND. It owns boot/kill, exec, file I/O, the
-``install_*`` bootstraps, the long-running agent spawn (with the E2B-specific
-done-marker poll pattern), patch capture, and the fresh-sandbox test runner.
+SANDBOX BACKEND: owns boot/kill, exec, file I/O, install bootstraps, the
+long-running agent spawn (done-marker poll pattern), patch capture, and the
+fresh-sandbox test runner.
 
-Public surface used by ``generate.py``::
-
-    async with E2BSandbox(image) as sb:
-        await install_node22(sb, host_tarball)
-        await install_claude_code(sb, host_tarball)
-        await ensure_agent_user(sb, workdir)
-        await sb.write_text(...); await sb.exec(...)
-        await run_claude_code(sb, ...)
-        diff = await git_diff(sb, workdir)
-
-    reward, solved, applied = await evaluate(
-        image=..., workdir=..., diff_text=..., swepro=..., f2p_script=...,
-        eval_cmd=..., pre_commands=..., timeout_sec=...,
-    )
-
----
-
-Forking this file:
-
-* Swap E2B for local docker / modal / your own VM cloud: rewrite ``E2BSandbox``
-  to expose the same 5 async primitives (exec / upload / write_text / read_text
-  / __aenter__ / __aexit__). Everything below it (install_node22, run_claude_code,
-  evaluate, etc.) only uses those primitives -- no E2B-specific code.
-
-* Swap claude_code for codex: replace ``install_claude_code`` and the
-  shell_command + env block inside ``run_claude_code``. The done-marker poll
-  pattern is generic and worth keeping for any long-running agent.
-
-* Add a new evaluation mode: extend ``evaluate()`` with another elif branch.
-  The 3 existing modes (swepro / f2p_script / eval_cmd) are self-contained
-  inner functions and easy to copy.
+See README.md for detailed forking guide. Public 5-primitive contract on
+E2BSandbox: exec / upload / write_text / read_text / __a*. Reimplement these
+on any backend (Docker / Modal / local VM) and the rest plugs in unchanged.
 """
 
 from __future__ import annotations
@@ -57,68 +29,56 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Tunables (env-driven so the same code runs across clusters)
 # ---------------------------------------------------------------------------
-# Optional sandbox metadata passed verbatim into ``AsyncSandbox.create``'s
-# ``metadata=`` kwarg. Some E2B-style backends use metadata for routing tags
-# (e.g. ``provider/size``, ``provider/group``); most setups don't need any.
-# Set ``SWE_SANDBOX_METADATA_JSON`` to a JSON object string if your backend
-# expects specific keys, e.g.::
-#
-#     export SWE_SANDBOX_METADATA_JSON='{"my-platform/size": "lg"}'
-#
-# Parsed once at import time; default is an empty dict.
 def _parse_sandbox_metadata() -> dict[str, str]:
-    raw = os.environ.get("SWE_SANDBOX_METADATA_JSON", "").strip()
+    """Read SWE_SANDBOX_METADATA_FILE (preferred) or SWE_SANDBOX_METADATA_JSON.
+    Returns a dict of string keys -> string values used for E2B routing tags."""
+    file_path = os.environ.get("SWE_SANDBOX_METADATA_FILE", "").strip()
+    raw = ""
+    if file_path:
+        try:
+            raw = Path(file_path).read_text()
+        except OSError as e:
+            logger.warning("[sandbox] SWE_SANDBOX_METADATA_FILE=%s unreadable: %s", file_path, e)
+            raw = ""
+    if not raw:
+        raw = os.environ.get("SWE_SANDBOX_METADATA_JSON", "").strip()
     if not raw:
         return {}
     try:
         md = json.loads(raw)
     except json.JSONDecodeError as e:
-        logger.warning("[sandbox] SWE_SANDBOX_METADATA_JSON not valid JSON, ignoring: %s", e)
+        logger.warning("[sandbox] metadata not valid JSON, ignoring: %s", e)
         return {}
     if not isinstance(md, dict):
-        logger.warning("[sandbox] SWE_SANDBOX_METADATA_JSON must be a JSON object, got %s", type(md).__name__)
+        logger.warning("[sandbox] metadata must be a JSON object, got %s", type(md).__name__)
         return {}
     return {str(k): str(v) for k, v in md.items()}
 
+
 SANDBOX_METADATA = _parse_sandbox_metadata()
-
-# Sandbox wall-clock lifetime in seconds. E2B kills the sandbox `timeout` seconds
-# after creation, regardless of activity (it is NOT an idle timeout — commands.run
-# does not auto-extend). SDK default is 300s; with claude-code agent runs > 5min
-# we need much more. We still kill the sandbox immediately via __aexit__ when the
-# context block exits, so this is just an upper-bound safety net to prevent leaks
-# if the host process crashes mid-run. Pro account cap is 86_400s (24h).
+SANDBOX_IMAGE_METADATA_KEY = os.environ.get(
+    "SWE_SANDBOX_IMAGE_METADATA_KEY", "glm-platform/image",
+)
 SANDBOX_LIFETIME_SEC = int(os.environ.get("SWE_SANDBOX_LIFETIME_SEC", "3600"))
-
-# RPC retry knobs. The e2b SDK rides on httpx + h2; long-lived sandboxes
-# accumulate transient h2 ProtocolErrors / connection resets (server-side
-# GOAWAY then httpx state-machine bug — see encode/httpx#2761). Each RPC is
-# idempotent, so we retry inline. Tune via SWE_RPC_RETRIES (default 3) and
-# SWE_RPC_RETRY_BASE_SEC (default 1.0; exponential).
 SWE_RPC_RETRIES = int(os.environ.get("SWE_RPC_RETRIES", "3"))
 SWE_RPC_RETRY_BASE_SEC = float(os.environ.get("SWE_RPC_RETRY_BASE_SEC", "1.0"))
 
-# Paths inside the sandbox (avoid clashes with whatever the image ships).
+# Paths inside the sandbox (avoid clashes with image-shipped paths).
 _PATCH = "/workspace/__cagent_patch__.diff"
 _PRE = "/workspace/__cagent_pre__.sh"
-_F2P = "/workspace/__cagent_f2p__.py"
 _SWEPRO_DIR = "/workspace/swepro_eval"
 
 
 def _is_transient_rpc_error(e: BaseException) -> bool:
-    """True if ``e`` looks like a transient client-side / network RPC failure
-    safe to retry. Includes httpx/h2 ProtocolError / WriteError / ReadError /
-    SSLError, and timeouts. Does NOT include CommandExitException (real cmd
-    failure) or SandboxException 'resource does not exist' (sandbox already
-    GC'd — retry won't bring it back)."""
+    """True if e is a transient client-side network failure safe to retry.
+    Excludes CommandExitException (real cmd failure) and SandboxException
+    'resource does not exist' (sandbox already GC'd)."""
     name = type(e).__name__
     if name in {"ProtocolError", "LocalProtocolError",
                 "WriteError", "ReadError", "ConnectError", "ConnectTimeout",
                 "ReadTimeout", "WriteTimeout", "PoolTimeout",
                 "RemoteProtocolError", "SSLError"}:
         return True
-    # e2b SandboxException with "resource does not exist" = sandbox dead; bail.
-    # Other SandboxException variants (e.g. network 5xx) may be retryable.
     msg = str(e)
     if name == "SandboxException":
         if "does not exist" in msg or "STOPPED state" in msg:
@@ -128,9 +88,9 @@ def _is_transient_rpc_error(e: BaseException) -> bool:
 
 
 async def _rpc_retry(op_name: str, coro_factory):
-    """Run ``coro_factory()`` with up to SWE_RPC_RETRIES attempts; only retry
-    on _is_transient_rpc_error. coro_factory must be a 0-arg callable that
-    returns a fresh awaitable each call (coroutines can only be awaited once)."""
+    """Run coro_factory() with up to SWE_RPC_RETRIES attempts; retry only on
+    _is_transient_rpc_error. coro_factory must be a 0-arg callable that
+    returns a fresh awaitable each call."""
     last_err = None
     for attempt in range(SWE_RPC_RETRIES):
         try:
@@ -150,11 +110,11 @@ async def _rpc_retry(op_name: str, coro_factory):
 
 
 # ---------------------------------------------------------------------------
-# Sandbox primitives
+# Sandbox primitives (5-primitive contract: replace E2B by reimplementing
+# these and the rest plugs in unchanged)
 # ---------------------------------------------------------------------------
 class E2BSandbox:
-    """Async context manager around ``e2b.AsyncSandbox`` with the few primitives
-    this demo actually uses."""
+    """Async context manager around e2b.AsyncSandbox."""
 
     def __init__(self, image: str, *, timeout: int | None = None) -> None:
         self.image = image
@@ -164,9 +124,8 @@ class E2BSandbox:
 
     async def __aenter__(self) -> "E2BSandbox":
         from e2b import AsyncSandbox  # type: ignore
-        # Internal E2B routing reads the image from metadata, not template.
         md = dict(SANDBOX_METADATA)
-        md.setdefault("glm-platform/image", self.image)
+        md.setdefault(SANDBOX_IMAGE_METADATA_KEY, self.image)
         self._sb = await AsyncSandbox.create(timeout=self.timeout, metadata=md)
         self.sandbox_id = self._sb.sandbox_id
         return self
@@ -187,10 +146,6 @@ class E2BSandbox:
         timeout: int = 120,
         check: bool = False,
     ) -> tuple[int, str, str]:
-        # e2b's commands.run raises CommandExitException on non-zero exit by
-        # default (no flag to suppress). Catch it so callers can rely on the
-        # `check` flag for raise/no-raise control. Transient h2/network errors
-        # are retried inline by _rpc_retry (does not include CommandExitException).
         from e2b.sandbox.commands.command_handle import CommandExitException
         try:
             res = await _rpc_retry(
@@ -209,8 +164,6 @@ class E2BSandbox:
             return e.exit_code, e.stdout or "", e.stderr or ""
 
     async def upload(self, host_path: str | Path, sandbox_path: str, *, user: str = "root") -> None:
-        # Retry the *whole* upload; e2b SDK uses a single POST so re-opening
-        # the file each attempt is required.
         async def _do():
             with open(host_path, "rb") as fp:
                 await self._sb.files.write(
@@ -239,13 +192,9 @@ class E2BSandbox:
 # Sandbox bootstrap (Node + Claude Code + agent user)
 # ---------------------------------------------------------------------------
 async def install_node22(sb: E2BSandbox, host_tarball: Path) -> None:
-    """Node 22 over the base image's Node (Debian 12 ships 16 which can't run
-    claude-code's cli.js). ``npm prefix=/usr/local`` is required for the
-    sweap-images family (see e2b_sweap_image_node_and_npm_quirks).
-
-    Decompresses ``.xz`` on the host (cached) so sandboxes without ``xz-utils``
-    (e.g. sweap-images / ScaleSWE) can still run plain ``tar xf``.
-    """
+    """Node 22 over the base image (Debian 12 ships 16; cli.js needs >= 20).
+    Decompresses .xz on the host (cached) so sandboxes without xz-utils can
+    still run plain `tar xf`. npm prefix=/usr/local required for sweap-images."""
     host_tarball = Path(host_tarball)
     if host_tarball.suffix == ".xz":
         plain = Path(tempfile.gettempdir()) / f"coding_agent_rl.{host_tarball.stem}.tar"
@@ -277,7 +226,8 @@ async def install_claude_code(sb: E2BSandbox, host_tarball: Path) -> None:
 
 
 async def ensure_agent_user(sb: E2BSandbox, workdir: str) -> None:
-    """Unprivileged 'agent' user that owns the workdir + can ``git diff``."""
+    """Create the unprivileged 'agent' user that owns workdir + can git diff.
+    Settings file pre-acks bypass-permissions so claude-code starts headless."""
     await sb.exec(
         f"id agent >/dev/null 2>&1 || useradd -m -s /bin/bash agent && "
         f"chown -R agent:agent /home/agent {workdir} && "
@@ -291,6 +241,7 @@ async def ensure_agent_user(sb: E2BSandbox, workdir: str) -> None:
 
 
 async def apply_before_repo_set_cmd(sb: E2BSandbox, workdir: str, swepro: dict) -> None:
+    """Run swepro['before_repo_set_cmd'] in the sandbox if present (no-op if not)."""
     before = swepro.get("before_repo_set_cmd") if swepro else None
     if not before:
         return
@@ -316,9 +267,10 @@ async def run_claude_code(
 ) -> int:
     """Spawn claude-code detached + poll a done-marker file.
 
-    E2B's gateway resets streaming HTTP/2 responses around 6.5 minutes, so we
-    can't keep a long-lived foreground exec. We write the exit code into a
-    marker file and check it every 15 s via short-lived RPCs."""
+    E2B's gateway resets HTTP/2 around 6.5 min, so we can't keep a long-lived
+    foreground exec. The launcher writes the exit code into a marker file
+    and we poll it every 5s via short RPCs (which also keeps the sandbox
+    alive against idle GC)."""
     done = f"{workdir}/.cagent_done"
     launcher = f"{workdir}/.cagent_run.sh"
     traj = f"{workdir}/claude_code_trajectory.jsonl"
@@ -340,7 +292,7 @@ async def run_claude_code(
 
     env = {
         "ANTHROPIC_BASE_URL": middleware_url,
-        "ANTHROPIC_AUTH_TOKEN": session_id,    # middleware reads this as session id
+        "ANTHROPIC_AUTH_TOKEN": session_id,
         "ANTHROPIC_MODEL": "slime-actor",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
         "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
@@ -353,10 +305,6 @@ async def run_claude_code(
         user="root", env=env, timeout=30, check=True,
     )
 
-    # Poll cadence: short enough to act as a sandbox-side keep-alive (the E2B
-    # platform GC-s sandboxes that look idle; setsid'd claude-code is
-    # invisible to it). 5s is well under any plausible eviction timeout while
-    # still being cheap compared to the multi-minute agent run.
     deadline = time.time() + time_budget_sec
     exit_code = -2  # convention: -2 = budget exceeded
     while time.time() < deadline:
@@ -386,7 +334,7 @@ async def git_diff(sb: E2BSandbox, workdir: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Eval-side test runners (run inside a fresh sandbox)
+# Eval (fresh sandbox, apply diff, run dataset tests)
 # ---------------------------------------------------------------------------
 async def evaluate(
     *,
@@ -394,17 +342,16 @@ async def evaluate(
     workdir: str,
     diff_text: str,
     swepro: dict | None = None,
-    f2p_script: str | None = None,
     eval_cmd: str | None = None,
     pre_commands: list[str] | str | None = None,
     timeout_sec: int = 600,
 ) -> tuple[float, bool, bool]:
-    """Boot a fresh sandbox, apply the diff, run the dataset's tests. Returns
-    ``(reward, solved, applied_cleanly)``. The "no test cheating" guarantee:
-    the eval sandbox is built from the same image but starts CLEAN, so the
-    only thing that affects reward is the model-produced diff."""
-    if not (swepro or f2p_script or eval_cmd):
-        logger.warning("[e2b.evaluate] no swepro/f2p_script/eval_cmd; reward=0")
+    """Returns (reward, solved, applied_cleanly).
+
+    No-test-cheating guarantee: the eval sandbox is built from the same image
+    but starts CLEAN, so only the model-produced diff affects reward."""
+    if not (swepro or eval_cmd):
+        logger.warning("[e2b.evaluate] no swepro/eval_cmd; reward=0")
         return 0.0, False, True
 
     async with E2BSandbox(image) as ev:
@@ -421,9 +368,6 @@ async def evaluate(
 
         if swepro:
             r, s = await _run_swepro(ev, workdir, swepro, timeout_sec)
-            return r, s, True
-        if f2p_script:
-            r, s = await _run_f2p(ev, workdir, f2p_script, timeout_sec)
             return r, s, True
         r, s = await _run_eval_cmd(ev, workdir, eval_cmd, timeout_sec)
         return r, s, True
@@ -485,15 +429,6 @@ async def _run_swepro(ev: E2BSandbox, workdir: str, swepro: dict, timeout: int) 
     required = set(swepro.get("fail_to_pass") or []) | set(swepro.get("pass_to_pass") or [])
     solved = bool(required) and required.issubset(passed)
     return (1.0 if solved else 0.0), solved
-
-
-async def _run_f2p(ev: E2BSandbox, workdir: str, script: str, timeout: int) -> tuple[float, bool]:
-    await ev.write_text(_F2P, script, user="agent")
-    ec, _, _ = await ev.exec(
-        f"cd {workdir} && python3 -m pytest -xvs {_F2P}",
-        user="agent", check=False, timeout=timeout,
-    )
-    return (1.0 if ec == 0 else 0.0), ec == 0
 
 
 async def _run_eval_cmd(ev: E2BSandbox, workdir: str, cmd: str, timeout: int) -> tuple[float, bool]:
