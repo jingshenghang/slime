@@ -54,6 +54,7 @@ import dataclasses
 import hashlib
 import json
 import logging
+import os
 import secrets
 import uuid
 from typing import Any
@@ -124,6 +125,21 @@ _Store = dict[str, Session]
 # pop_session_split; _closed is a permanent tombstone (late requests 503).
 _inflight: dict[str, set[asyncio.Task]] = {}
 _closed: set[str] = set()
+
+# Monotonic max of sglang meta_info.weight_version across all turns in
+# this process. -1 until sglang first stamps a response.
+_current_weight_version: int = -1
+
+
+def current_weight_version() -> int:
+    return _current_weight_version
+
+
+# Cap how many times _generate will resubmit the same turn with
+# (prompt + partial_output) after sglang aborts mid-stream (weight
+# update). Each retry costs one fresh /generate; capped to avoid
+# pathological loops if aborts keep firing back-to-back.
+_MAX_RESUME_RETRIES = int(os.environ.get("SWE_MAX_RESUME_RETRIES", "5"))
 
 
 # =============================================================================
@@ -336,14 +352,83 @@ def _build_prompt(target: Chain, body: dict, kind: str, tok) -> list[int]:
     return _render_token_ids(target, tok)
 
 
-async def _generate(prompt_ids: list[int], s: Session, body: dict, app) -> TurnRecord:
-    """Call sglang and return a TurnRecord.
+async def _abort_rid(sglang_url: str, rid: str) -> None:
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
+            await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
+    except Exception:
+        pass
 
-    1. build sampling_params (session defaults overlaid with body overrides)
-    2. POST sglang /generate; on cancel/error fire /abort_request
-    3. keep the exact prompt/output token ids; trajectory merge later compares
-       later prompt tokens with earlier outputs to build the loss mask
-    """
+
+async def _stream_generate(
+    sglang_url: str,
+    rid: str,
+    input_ids: list[int],
+    sp: dict,
+    out_ids: list[int],
+    out_log_probs: list[float],
+) -> str:
+    """Stream sglang /generate. Writes cumulative continuation tokens into
+    out_ids[] and aligned per-token log_probs into out_log_probs[] as they
+    arrive (so the caller sees partial output + logprobs even if we raise).
+    Returns finish_reason ('stop'/'length'/'abort'/...). Bumps
+    _current_weight_version inline."""
+    out_ids.clear()
+    out_log_probs.clear()
+    finish = "abort"
+    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
+    async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
+        f"{sglang_url}/generate",
+        json={
+            "rid": rid,
+            "input_ids": input_ids,
+            "sampling_params": sp,
+            "return_logprob": True,
+            "stream": True,
+        },
+    ) as r:
+        if r.status >= 400:
+            text = await r.text()
+            raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
+        while True:
+            line = await r.content.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line.startswith(b"data:"):
+                continue
+            payload = line[5:].strip()
+            if payload == b"[DONE]":
+                break
+            try:
+                obj = json.loads(payload)
+            except json.JSONDecodeError:
+                continue
+            meta = obj.get("meta_info") or {}
+            wv = meta.get("weight_version")
+            if isinstance(wv, int):
+                global _current_weight_version
+                if wv > _current_weight_version:
+                    _current_weight_version = wv
+            logprobs = meta.get("output_token_logprobs") or []
+            if logprobs:
+                out_ids[:] = [x[1] for x in logprobs]
+                out_log_probs[:] = [float(x[0]) for x in logprobs]
+            fr = (meta.get("finish_reason") or {}).get("type")
+            if fr:
+                finish = fr
+    return finish
+
+
+async def _generate(prompt_ids: list[int], s: Session, body: dict, app) -> TurnRecord:
+    """Call sglang and return a TurnRecord. On abort caused by weight-update
+    (sglang sends ``finish_reason.type == "abort"`` or the stream drops),
+    re-issue with ``prompt_ids + partial output`` so the continuation runs
+    under the new weights -- this is what makes the fully_async rollout
+    retain in-flight work across weight updates instead of starting the
+    turn over. The merged prompt+partial+continuation comes back as one
+    TurnRecord; loss-mask reconstruction is done later in
+    ``slime.agent.trajectory.merge_turns``."""
     # ---- (a) Build sampling_params --------------------------------------
     sp: dict[str, Any] = {
         "skip_special_tokens": False,
@@ -377,42 +462,71 @@ async def _generate(prompt_ids: list[int], s: Session, body: dict, app) -> TurnR
             )
         sp["max_new_tokens"] = min(int(sp.get("max_new_tokens", remaining_context)), remaining_context)
 
-    # ---- (b) POST sglang /generate (with abort on cancel/error) --------
-    # Without abort, a cancelled client + inflight request can race with the
-    # next release_memory_occupation and trip sglang's "server is idle" assert.
+    # ---- (b) Stream + partial-resume loop -------------------------------
     sglang_url = app["sglang_url"]
-    rid = uuid.uuid4().hex
-    timeout = aiohttp.ClientTimeout(total=None, sock_read=900)
-    try:
-        async with aiohttp.ClientSession(timeout=timeout) as sess, sess.post(
-            f"{sglang_url}/generate",
-            json={
-                "rid": rid,
-                "input_ids": prompt_ids,
-                "sampling_params": sp,
-                "return_logprob": True,
-            },
-        ) as r:
-            if r.status >= 400:
-                text = await r.text()
-                raise RuntimeError(f"sglang upstream {r.status}: {text[:400]}")
-            # SGLang's /generate can return JSON with application/octet-stream
-            # as the Content-Type; aiohttp rejects that unless we disable the
-            # header check.
-            data = await r.json(content_type=None)
-        meta = data.get("meta_info") or {}
-        output_token_logprobs = meta.get("output_token_logprobs") or []
-        output_ids = [x[1] for x in output_token_logprobs]
-        output_log_probs = [float(x[0]) for x in output_token_logprobs]
-        finish = (meta.get("finish_reason") or {}).get("type", "stop") or "stop"
-    except (asyncio.CancelledError, aiohttp.ClientError, asyncio.TimeoutError):
-        # Best-effort abort with fresh short-timeout session; swallow errors.
+    # ---- (b) Stream + partial-resume loop -------------------------------
+    sglang_url = app["sglang_url"]
+    accumulated: list[int] = []
+    accumulated_log_probs: list[float] = []
+    finish = "abort"
+    for attempt in range(_MAX_RESUME_RETRIES + 1):
+        target_max = int(sp.get("max_new_tokens") or 0)
+        if target_max:
+            remaining = target_max - len(accumulated)
+            if remaining <= 0:
+                finish = "length"
+                break
+            attempt_sp = {**sp, "max_new_tokens": remaining}
+        else:
+            attempt_sp = dict(sp)
+        rid = uuid.uuid4().hex
+        attempt_prompt = list(prompt_ids) + accumulated
+        attempt_output: list[int] = []
+        attempt_log_probs: list[float] = []
         try:
-            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=5)) as s2:
-                await s2.post(f"{sglang_url}/abort_request", json={"rid": rid})
-        except Exception:
-            pass
-        raise
+            attempt_finish = await _stream_generate(
+                sglang_url, rid, attempt_prompt, attempt_sp, attempt_output, attempt_log_probs
+            )
+        except asyncio.CancelledError:
+            await _abort_rid(sglang_url, rid)
+            raise
+        except (aiohttp.ClientError, asyncio.TimeoutError, RuntimeError) as e:
+            await _abort_rid(sglang_url, rid)
+            attempt_finish = "abort"
+            if attempt == _MAX_RESUME_RETRIES and not accumulated and not attempt_output:
+                raise
+            logger.warning(
+                "[middleware] stream error on attempt %d: %r (partial=%d)", attempt + 1, e, len(attempt_output)
+            )
+
+        accumulated.extend(attempt_output)
+        accumulated_log_probs.extend(attempt_log_probs)
+
+        if attempt_finish != "abort":
+            finish = attempt_finish
+            break
+        if attempt == _MAX_RESUME_RETRIES:
+            logger.warning(
+                "[middleware] partial-resume budget exhausted (%d retries); returning %d-tok partial as abort",
+                _MAX_RESUME_RETRIES,
+                len(accumulated),
+            )
+            break
+        if attempt > 0 and not attempt_output:
+            # No forward progress on a retry; back-to-back aborts that yield
+            # nothing mean something other than a normal weight-update pause
+            # is happening. Bail.
+            logger.warning("[middleware] partial-resume: no progress on attempt %d; bailing", attempt + 1)
+            break
+        logger.info(
+            "[middleware] partial-resume: attempt %d aborted (new=%d, total=%d); continuing under new weights",
+            attempt + 1,
+            len(attempt_output),
+            len(accumulated),
+        )
+
+    output_ids = accumulated
+    output_log_probs = accumulated_log_probs
 
     return TurnRecord(
         prompt_ids=list(prompt_ids),

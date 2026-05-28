@@ -183,6 +183,7 @@ def _merge_samples(
         "is_solved": reward_result.is_solved,
         "applied_cleanly": reward_result.applied_cleanly,
         "elapsed_sec": elapsed_sec,
+        "weight_version": middleware.current_weight_version(),
     }
 
     # All K samples share rollout_id so the loss reducer counts this
