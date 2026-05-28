@@ -40,8 +40,11 @@ Design notes:
 * Loss-mask repair happens in `trajectory.merge_turns`: later prompt tokens are
   compared with earlier generated tokens, and unmatched historical outputs stop
   being trainable.
-* `_hash` strips Anthropic `cache_control` keys before hashing so the same
-  logical message hashes identically across turns even as cache_control moves.
+* `_hash` whitelists semantic fields per Anthropic shape (see `_FIELDS`)
+  so runtime metadata -- today `cache_control` / `signature`, tomorrow
+  whatever Anthropic ships next -- cannot perturb the fingerprint. Unknown
+  block types fall through with all fields preserved (over-invalidate rather
+  than silently merge two distinct blocks on a shared prefix).
 * Server lifecycle (binding a port, running the loop, `handler_cancellation`)
   lives in the caller, not here -- see `start()` for the required runner
   contract.
@@ -71,19 +74,36 @@ logger = logging.getLogger(__name__)
 _SUBAGENT_TOOLS = {"Task", "Agent"}
 
 
-def _strip_cache_control(obj: Any) -> Any:
-    """Drop Anthropic prompt-caching ``cache_control`` keys before hashing -
-    cache_control moves across turns so the same logical message would
-    otherwise hash differently each request."""
-    if isinstance(obj, dict):
-        return {k: _strip_cache_control(v) for k, v in obj.items() if k != "cache_control"}
+# Whitelist of semantic fields per Anthropic shape (messages + block types).
+# Any field not listed (cache_control, citations, signature, future telemetry)
+# is dropped from the fingerprint so it cannot perturb chain-continuation
+# detection. Unknown block types fall through with all fields preserved --
+# over-invalidate rather than silently merge two distinct blocks on a shared
+# prefix.
+_FIELDS: dict[str, tuple[str, ...]] = {
+    "__message__": ("role", "content"),
+    "text": ("type", "text"),
+    "thinking": ("type", "thinking"),
+    "tool_use": ("type", "id", "name", "input"),
+    "tool_result": ("type", "tool_use_id", "content", "is_error"),
+}
+
+
+def _canonical(obj: Any) -> Any:
+    """Project to whitelisted semantic fields for hashing."""
     if isinstance(obj, list):
-        return [_strip_cache_control(x) for x in obj]
-    return obj
+        return [_canonical(x) for x in obj]
+    if not isinstance(obj, dict):
+        return obj
+    kind = "__message__" if "role" in obj else obj.get("type")
+    kept = _FIELDS.get(kind) if isinstance(kind, str) else None
+    if kept is None:
+        return obj
+    return {k: _canonical(obj[k]) for k in kept if k in obj}
 
 
 def _hash(obj: Any) -> str:
-    payload = json.dumps(_strip_cache_control(obj), sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    payload = json.dumps(_canonical(obj), sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
     return hashlib.sha1(payload).hexdigest()[:12]
 
 
