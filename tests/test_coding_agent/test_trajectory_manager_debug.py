@@ -8,7 +8,7 @@ we don't depend on middleware wiring.
 from __future__ import annotations
 
 
-from examples.coding_agent_rl.trajectory_manager_debug import dump_tree_json, dump_tree_txt  # noqa: E402
+from tests.test_coding_agent._dump_helpers import dump_tree_json, dump_tree_txt  # noqa: E402
 from slime.agent.trajectory_manager import TrajectoryManager  # noqa: E402
 
 

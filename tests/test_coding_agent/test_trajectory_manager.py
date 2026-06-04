@@ -17,7 +17,6 @@ import json
 import logging
 
 from slime.agent.trajectory_manager import (  # noqa: E402
-    Node,
     TrajectoryManager,
     _group_messages_by_role,
     _lcp_len,
@@ -146,19 +145,27 @@ def _three_turn_session(tok):
     p1 = _render_prompt([sys_msg, user1], tokenizer=tok)
     r1 = _render_response("Computing.", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user1], tools=TOOLS_OPENAI,
-        prompt_ids=p1, response_ids=r1,
+        sid,
+        prompt_messages=[sys_msg, user1],
+        tools=TOOLS_OPENAI,
+        prompt_ids=p1,
+        response_ids=r1,
         response_logprobs=[-0.5] * len(r1),
-        response_message=asst1, finish_reason="tool_calls",
+        response_message=asst1,
+        finish_reason="tool_calls",
     )
 
     p2 = _render_prompt([sys_msg, user1, asst1, tool1], tokenizer=tok)
     r2 = _render_response("Answer is 4.", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user1, asst1, tool1], tools=TOOLS_OPENAI,
-        prompt_ids=p2, response_ids=r2,
+        sid,
+        prompt_messages=[sys_msg, user1, asst1, tool1],
+        tools=TOOLS_OPENAI,
+        prompt_ids=p2,
+        response_ids=r2,
         response_logprobs=[-0.4] * len(r2),
-        response_message=asst2, finish_reason="stop",
+        response_message=asst2,
+        finish_reason="stop",
     )
     return mgr, sid, [(p1, r1), (p2, r2)]
 
@@ -172,8 +179,12 @@ def test_append_single_turn_shapes_tree():
     p = _render_prompt([sys_msg, user1], tokenizer=tok)
     r = _render_response("a", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user1], tools=None,
-        prompt_ids=p, response_ids=r, response_logprobs=None,
+        sid,
+        prompt_messages=[sys_msg, user1],
+        tools=None,
+        prompt_ids=p,
+        response_ids=r,
+        response_logprobs=None,
         response_message={"role": "assistant", "content": "a"},
         finish_reason="stop",
     )
@@ -212,8 +223,11 @@ def test_fork_on_text_diff():
         user = {"role": "user", "content": content}
         p = _render_prompt([sys_msg, user], tokenizer=tok)
         mgr.append_turn(
-            sid, prompt_messages=[sys_msg, user], tools=None,
-            prompt_ids=p, response_ids=_render_response(content[-1], tokenizer=tok),
+            sid,
+            prompt_messages=[sys_msg, user],
+            tools=None,
+            prompt_ids=p,
+            response_ids=_render_response(content[-1], tokenizer=tok),
             response_logprobs=None,
             response_message={"role": "assistant", "content": content[-1]},
             finish_reason="stop",
@@ -240,8 +254,11 @@ def test_no_fork_on_token_only_diff():
     user1 = {"role": "user", "content": "u"}
     pa = _render_prompt([sys_msg, user1], tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user1], tools=None,
-        prompt_ids=pa, response_ids=_render_response("a", tokenizer=tok),
+        sid,
+        prompt_messages=[sys_msg, user1],
+        tools=None,
+        prompt_ids=pa,
+        response_ids=_render_response("a", tokenizer=tok),
         response_logprobs=None,
         response_message={"role": "assistant", "content": "a"},
         finish_reason="stop",
@@ -249,8 +266,11 @@ def test_no_fork_on_token_only_diff():
     tampered = list(pa)
     tampered[1] = tampered[1] ^ 1
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user1], tools=None,
-        prompt_ids=tampered, response_ids=_render_response("b", tokenizer=tok),
+        sid,
+        prompt_messages=[sys_msg, user1],
+        tools=None,
+        prompt_ids=tampered,
+        response_ids=_render_response("b", tokenizer=tok),
         response_logprobs=None,
         response_message={"role": "assistant", "content": "b"},
         finish_reason="stop",
@@ -276,8 +296,11 @@ def test_cross_sid_isolation():
         user = {"role": "user", "content": content}
         p = _render_prompt([sys_msg, user], tokenizer=tok)
         mgr.append_turn(
-            sid, prompt_messages=[sys_msg, user], tools=None,
-            prompt_ids=p, response_ids=_render_response(content[-1], tokenizer=tok),
+            sid,
+            prompt_messages=[sys_msg, user],
+            tools=None,
+            prompt_ids=p,
+            response_ids=_render_response(content[-1], tokenizer=tok),
             response_logprobs=None,
             response_message={"role": "assistant", "content": content[-1]},
             finish_reason="stop",
@@ -302,13 +325,26 @@ def test_role_tool_in_chain():
     r1 = _render_response("a1", tokenizer=tok)
     p2 = _render_prompt([sys_msg, user1, asst1, tool_a, tool_b], tokenizer=tok)
     r2 = _render_response("a2", tokenizer=tok)
-    mgr.append_turn(sid, prompt_messages=[sys_msg, user1], tools=None,
-                    prompt_ids=p1, response_ids=r1, response_logprobs=None,
-                    response_message=asst1, finish_reason="stop")
-    mgr.append_turn(sid, prompt_messages=[sys_msg, user1, asst1, tool_a, tool_b],
-                    tools=None,
-                    prompt_ids=p2, response_ids=r2, response_logprobs=None,
-                    response_message=asst2, finish_reason="stop")
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user1],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=None,
+        response_message=asst1,
+        finish_reason="stop",
+    )
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user1, asst1, tool_a, tool_b],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=None,
+        response_message=asst2,
+        finish_reason="stop",
+    )
 
     chain = list(mgr._trees[sid].leaves())[0].path_from_root()
     roles = [n.role for n in chain]
@@ -324,11 +360,16 @@ def test_response_logprobs_length_mismatch_raises():
     user1 = {"role": "user", "content": "u"}
     p = _render_prompt([sys_msg, user1], tokenizer=tok)
     try:
-        mgr.append_turn("x", prompt_messages=[sys_msg, user1], tools=None,
-                        prompt_ids=p, response_ids=[1, 2, 3],
-                        response_logprobs=[-0.1, -0.2],
-                        response_message={"role": "assistant", "content": ""},
-                        finish_reason="stop")
+        mgr.append_turn(
+            "x",
+            prompt_messages=[sys_msg, user1],
+            tools=None,
+            prompt_ids=p,
+            response_ids=[1, 2, 3],
+            response_logprobs=[-0.1, -0.2],
+            response_message={"role": "assistant", "content": ""},
+            finish_reason="stop",
+        )
     except ValueError as e:
         assert "response_logprobs length" in str(e)
         print("PASS test_response_logprobs_length_mismatch_raises")
@@ -342,9 +383,16 @@ def test_response_ids_empty_ok():
     sys_msg = {"role": "system", "content": "S"}
     user1 = {"role": "user", "content": "u"}
     p = _render_prompt([sys_msg, user1], tokenizer=tok)
-    mgr.append_turn("x", prompt_messages=[sys_msg, user1], tools=None,
-                    prompt_ids=p, response_ids=[], response_logprobs=None,
-                    response_message=None, finish_reason="stop")
+    mgr.append_turn(
+        "x",
+        prompt_messages=[sys_msg, user1],
+        tools=None,
+        prompt_ids=p,
+        response_ids=[],
+        response_logprobs=None,
+        response_message=None,
+        finish_reason="stop",
+    )
     chain = list(mgr._trees["x"].leaves())[0].path_from_root()
     asst = chain[-1]
     assert asst.role == "assistant"
@@ -368,8 +416,12 @@ def test_get_trajectory_single_turn():
     p = _render_prompt([sys_msg, user], tokenizer=tok)
     r = _render_response("a", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user], tools=TOOLS_OPENAI,
-        prompt_ids=p, response_ids=r, response_logprobs=[-0.5] * len(r),
+        sid,
+        prompt_messages=[sys_msg, user],
+        tools=TOOLS_OPENAI,
+        prompt_ids=p,
+        response_ids=r,
+        response_logprobs=[-0.5] * len(r),
         response_message={"role": "assistant", "content": "a"},
         finish_reason="stop",
     )
@@ -430,9 +482,14 @@ def test_get_trajectory_tito_drift_drops_and_replaces():
     p1 = _render_prompt([sys_msg, user], tokenizer=tok)
     r1 = _render_response("a1", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user], tools=None,
-        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
-        response_message=asst1, finish_reason="tool_calls",
+        sid,
+        prompt_messages=[sys_msg, user],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=[-0.5] * len(r1),
+        response_message=asst1,
+        finish_reason="tool_calls",
     )
     # Build turn 2 prompt the "honest" way (what chat template would emit),
     # then INJECT a synthetic divergence inside the assistant response region
@@ -449,9 +506,14 @@ def test_get_trajectory_tito_drift_drops_and_replaces():
     p2 = p2[:drift_at] + [77777, 77778, 77779] + p2[drift_at:]
     r2 = _render_response("a2", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
-        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
-        response_message=asst2, finish_reason="stop",
+        sid,
+        prompt_messages=[sys_msg, user, asst1, tool],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=[-0.4] * len(r2),
+        response_message=asst2,
+        finish_reason="stop",
     )
 
     samples = mgr.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
@@ -469,19 +531,10 @@ def test_get_trajectory_tito_drift_drops_and_replaces():
     # the (L - len(p1)) into r1 region are 1 (response).
     in_r1_kept = L - len(p1)
     assert in_r1_kept >= 0
-    expected_loss = (
-        [0] * len(p1) + [1] * in_r1_kept + [0] * (len(p2) - L) + [1] * len(r2)
-    )
-    expected_logp = (
-        [0.0] * len(p1)
-        + [-0.5] * in_r1_kept
-        + [0.0] * (len(p2) - L)
-        + [-0.4] * len(r2)
-    )
+    expected_loss = [0] * len(p1) + [1] * in_r1_kept + [0] * (len(p2) - L) + [1] * len(r2)
+    expected_logp = [0.0] * len(p1) + [-0.5] * in_r1_kept + [0.0] * (len(p2) - L) + [-0.4] * len(r2)
 
-    assert s.tokens == expected_tokens, (
-        f"len got={len(s.tokens)} want={len(expected_tokens)}"
-    )
+    assert s.tokens == expected_tokens, f"len got={len(s.tokens)} want={len(expected_tokens)}"
     assert s.loss_mask == expected_loss
     assert s.rollout_log_probs == expected_logp
     assert s.response_length == in_r1_kept + len(r2)
@@ -503,15 +556,29 @@ def test_get_trajectory_tito_drift_logs_warning():
 
     p1 = _render_prompt([sys_msg, user], tokenizer=tok)
     r1 = _render_response("a1", tokenizer=tok)
-    mgr.append_turn(sid, prompt_messages=[sys_msg, user], tools=None,
-                    prompt_ids=p1, response_ids=r1, response_logprobs=None,
-                    response_message=asst1, finish_reason="tool_calls")
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=None,
+        response_message=asst1,
+        finish_reason="tool_calls",
+    )
     p2 = _render_prompt([sys_msg, user, asst1, tool], tokenizer=tok)
-    p2 = p2[:len(p1) + 1] + [42, 43] + p2[len(p1) + 1:]
+    p2 = p2[: len(p1) + 1] + [42, 43] + p2[len(p1) + 1 :]
     r2 = _render_response("a2", tokenizer=tok)
-    mgr.append_turn(sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
-                    prompt_ids=p2, response_ids=r2, response_logprobs=None,
-                    response_message=asst2, finish_reason="stop")
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user, asst1, tool],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=None,
+        response_message=asst2,
+        finish_reason="stop",
+    )
 
     records: list[str] = []
 
@@ -541,8 +608,12 @@ def test_get_trajectory_two_leaves_share_reward():
         p = _render_prompt([sys_msg, user], tokenizer=tok)
         r = _render_response(content[-1], tokenizer=tok)
         mgr.append_turn(
-            sid, prompt_messages=[sys_msg, user], tools=None,
-            prompt_ids=p, response_ids=r, response_logprobs=None,
+            sid,
+            prompt_messages=[sys_msg, user],
+            tools=None,
+            prompt_ids=p,
+            response_ids=r,
+            response_logprobs=None,
             response_message={"role": "assistant", "content": content[-1]},
             finish_reason="stop",
         )
@@ -572,7 +643,7 @@ def test_get_trajectory_keep_when_drop_false():
 
 
 def test_debug_dump_shape():
-    from examples.coding_agent_rl.trajectory_manager_debug import dump_tree_json, dump_tree_txt
+    from tests.test_coding_agent._dump_helpers import dump_tree_json, dump_tree_txt
 
     tok = FakeTokenizer()
     mgr, sid, _ = _three_turn_session(tok)
@@ -614,18 +685,28 @@ def test_get_trajectory_tito_snapshot_disabled_by_default():
     r1 = _render_response("a1" * 600, tokenizer=tok)
     assert len(r1) > 1000, f"need >1000 loss tokens for the test, got {len(r1)}"
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user], tools=None,
-        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
-        response_message=asst1, finish_reason="tool_calls",
+        sid,
+        prompt_messages=[sys_msg, user],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=[-0.5] * len(r1),
+        response_message=asst1,
+        finish_reason="tool_calls",
     )
     p2_honest = _render_prompt([sys_msg, user, asst1, tool], tokenizer=tok)
     drift_at = len(p1) + 1
     p2 = p2_honest[:drift_at] + [77777, 77778, 77779] + p2_honest[drift_at:]
     r2 = _render_response("a2", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
-        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
-        response_message=asst2, finish_reason="stop",
+        sid,
+        prompt_messages=[sys_msg, user, asst1, tool],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=[-0.4] * len(r2),
+        response_message=asst2,
+        finish_reason="stop",
     )
 
     samples = mgr.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
@@ -657,9 +738,14 @@ def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
     r1 = _render_response("a" * 500, tokenizer=tok)
     assert len(r1) > 100
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user], tools=None,
-        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
-        response_message=asst1, finish_reason="tool_calls",
+        sid,
+        prompt_messages=[sys_msg, user],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=[-0.5] * len(r1),
+        response_message=asst1,
+        finish_reason="tool_calls",
     )
     # Splice a fake divergence right at len(p1), so the entire r1 sits in drift.
     p2_honest = _render_prompt([sys_msg, user, asst1, tool], tokenizer=tok)
@@ -667,13 +753,19 @@ def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
     p2 = p2_honest[:drift_at] + [77777] + p2_honest[drift_at:]
     r2 = _render_response("a2", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
-        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
-        response_message=asst2, finish_reason="stop",
+        sid,
+        prompt_messages=[sys_msg, user, asst1, tool],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=[-0.4] * len(r2),
+        response_message=asst2,
+        finish_reason="stop",
     )
 
     samples = mgr.get_trajectory(
-        sid, base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
+        sid,
+        base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
         reward=1.0,
     )
     assert len(samples) == 2, f"expected 1 snapshot + 1 main, got {len(samples)}"
@@ -694,17 +786,28 @@ def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
     mgr_off = TrajectoryManager(tokenizer=tok)
     sid_off = "snap-off-baseline"
     mgr_off.append_turn(
-        sid_off, prompt_messages=[sys_msg, user], tools=None,
-        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
-        response_message=asst1, finish_reason="tool_calls",
+        sid_off,
+        prompt_messages=[sys_msg, user],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=[-0.5] * len(r1),
+        response_message=asst1,
+        finish_reason="tool_calls",
     )
     mgr_off.append_turn(
-        sid_off, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
-        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
-        response_message=asst2, finish_reason="stop",
+        sid_off,
+        prompt_messages=[sys_msg, user, asst1, tool],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=[-0.4] * len(r2),
+        response_message=asst2,
+        finish_reason="stop",
     )
     baseline = mgr_off.get_trajectory(
-        sid_off, base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
+        sid_off,
+        base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
         reward=1.0,
     )[0]
     assert main.tokens == baseline.tokens
@@ -732,18 +835,28 @@ def test_get_trajectory_tito_snapshot_skipped_when_below_threshold():
     p1 = _render_prompt([sys_msg, user], tokenizer=tok)
     r1 = _render_response("a1", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user], tools=None,
-        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
-        response_message=asst1, finish_reason="tool_calls",
+        sid,
+        prompt_messages=[sys_msg, user],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=[-0.5] * len(r1),
+        response_message=asst1,
+        finish_reason="tool_calls",
     )
     p2_honest = _render_prompt([sys_msg, user, asst1, tool], tokenizer=tok)
     drift_at = len(p1) + 1
     p2 = p2_honest[:drift_at] + [77777, 77778, 77779] + p2_honest[drift_at:]
     r2 = _render_response("a2", tokenizer=tok)
     mgr.append_turn(
-        sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
-        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
-        response_message=asst2, finish_reason="stop",
+        sid,
+        prompt_messages=[sys_msg, user, asst1, tool],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=[-0.4] * len(r2),
+        response_message=asst2,
+        finish_reason="stop",
     )
 
     samples = mgr.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)

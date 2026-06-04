@@ -18,6 +18,7 @@ import asyncio
 import dataclasses
 import json
 import logging
+import re
 import secrets
 from collections.abc import Callable
 from typing import Any
@@ -67,6 +68,7 @@ class AnthropicAdapter(BaseAdapter):
         tool_parser=None,
         reasoning_parser=None,
         tito_snapshot_min_loss_tokens: int | None = None,
+        max_turns_per_sid: int | None = None,
         on_turn_appended: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(
@@ -85,6 +87,11 @@ class AnthropicAdapter(BaseAdapter):
         #             prompt_ids, response_ids, finish_reason) -> None.
         # Exceptions are swallowed; never block the SSE response.
         self.on_turn_appended: Callable[..., None] | None = on_turn_appended
+        # Per-sid turn cap; None disables. When set, /v1/messages returns 429
+        # once a sid has made this many turns. Prevents runaway agents from
+        # burning the whole budget.
+        self.max_turns_per_sid: int | None = max_turns_per_sid
+        self._sid_turn_count: dict[str, int] = {}
         self.app.router.add_post("/v1/messages", _handle_request)
         self.app.router.add_post("/v1/messages/count_tokens", _count_tokens)
         self.app.router.add_get("/healthz", _ok)
@@ -120,6 +127,140 @@ class AnthropicAdapter(BaseAdapter):
 # =============================================================================
 # Translation (Anthropic wire <-> chat-template messages)
 # =============================================================================
+
+
+# Claude Code CLI leaks ``x-anthropic-billing-header: ...cch=<hash>;`` as a text
+# block at the top of the system prompt. The cch hash changes per request, so
+# without stripping it the rendered system tokens differ every turn and the
+# manager tree can't chain consecutive turns together.
+_CLAUDE_CODE_BILLING_HEADER_RE = re.compile(
+    r"^\s*x-anthropic-billing-header:[^\n]*\n?",
+    re.IGNORECASE,
+)
+
+
+def _scrub_claude_code_billing_header_in_body(body_obj: dict) -> bool:
+    """Strip Claude Code's billing-header sidechannel from ``body['system']``.
+
+    Handles both Anthropic shapes (``system: str`` and
+    ``system: list[{type:"text",text:"..."}]``). Mutates ``body_obj`` in
+    place; returns True iff anything changed.
+    """
+    sysm = body_obj.get("system")
+    changed = False
+    if isinstance(sysm, str):
+        cleaned = _CLAUDE_CODE_BILLING_HEADER_RE.sub("", sysm)
+        if cleaned != sysm:
+            body_obj["system"] = cleaned if cleaned.strip() else ""
+            changed = True
+    elif isinstance(sysm, list):
+        new_blocks: list = []
+        for block in sysm:
+            if not isinstance(block, dict) or block.get("type") != "text":
+                new_blocks.append(block)
+                continue
+            txt = block.get("text") or ""
+            cleaned = _CLAUDE_CODE_BILLING_HEADER_RE.sub("", txt)
+            if not cleaned.strip():
+                # Whole block was the sidechannel — drop it.
+                changed = True
+                continue
+            if cleaned != txt:
+                new_block = dict(block)
+                new_block["text"] = cleaned
+                new_blocks.append(new_block)
+                changed = True
+            else:
+                new_blocks.append(block)
+        if changed:
+            body_obj["system"] = new_blocks
+    return changed
+
+
+_MID_SYSTEM_WRAP_PREFIX = "<system-reminder>\n"
+_MID_SYSTEM_WRAP_SUFFIX = "\n</system-reminder>\n"
+
+
+def _flatten_anth_text_for_fold(content: Any) -> str:
+    """Best-effort flatten of an Anthropic content value to plain text, used by
+    :func:`_fold_mid_list_system_into_user` when wrapping a folded block."""
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if not isinstance(content, list):
+        return str(content)
+    parts: list[str] = []
+    for b in content:
+        if isinstance(b, dict) and b.get("type") == "text":
+            parts.append(b.get("text", ""))
+        elif isinstance(b, str):
+            parts.append(b)
+    return "\n".join(p for p in parts if p)
+
+
+def _fold_mid_list_system_into_user(body_obj: dict) -> bool:
+    """Fold non-leading ``role: system`` messages into a neighbouring user
+    message as a ``<system-reminder>`` text block. Mutates ``body_obj`` in
+    place; returns True iff any fold happened.
+
+    Claude Code CLI >= 2.1.161 inserts ``{"role":"system","content":"<skills
+    list>"}`` in the middle of ``messages``. Qwen3-style chat templates reject
+    any system message past index 0 with ``System message must be at the
+    beginning.`` This wrap mirrors the older claude-code (<= 2.1.143)
+    behaviour by attaching the wrapped reminder to the preceding user message
+    (or the next one if no prior user message exists).
+    """
+    msgs = body_obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return False
+
+    system_idx = [i for i, m in enumerate(msgs) if isinstance(m, dict) and m.get("role") == "system" and i > 0]
+    if not system_idx:
+        return False
+
+    def _promote_to_list(msg: dict) -> list:
+        c = msg.get("content")
+        if isinstance(c, list):
+            return c
+        msg["content"] = [{"type": "text", "text": c if isinstance(c, str) else ""}]
+        return msg["content"]
+
+    def _wrap(text: str) -> dict:
+        return {
+            "type": "text",
+            "text": _MID_SYSTEM_WRAP_PREFIX + text + _MID_SYSTEM_WRAP_SUFFIX,
+        }
+
+    changed = False
+    TOMBSTONE: dict = {"__folded__": True}
+    for i in system_idx:
+        sys_msg = msgs[i]
+        wrapped = _wrap(_flatten_anth_text_for_fold(sys_msg.get("content")))
+        target = None
+        for j in range(i - 1, -1, -1):
+            cand = msgs[j]
+            if isinstance(cand, dict) and cand.get("role") == "user":
+                target = cand
+                _promote_to_list(target).append(wrapped)
+                break
+        if target is None:
+            for j in range(i + 1, len(msgs)):
+                cand = msgs[j]
+                if isinstance(cand, dict) and cand.get("role") == "user":
+                    target = cand
+                    _promote_to_list(target).insert(0, wrapped)
+                    break
+        if target is None:
+            msgs[i] = {"role": "user", "content": [wrapped]}
+            changed = True
+            continue
+        msgs[i] = TOMBSTONE
+        changed = True
+
+    if changed:
+        body_obj["messages"] = [m for m in msgs if m is not TOMBSTONE]
+    return changed
 
 
 def _flatten(c: Any) -> str:
@@ -388,6 +529,33 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
     adapter = request.app[ADAPTER_KEY]
     if sid in adapter.closed:  # session drained; refuse stragglers
         return web.Response(status=503, text="session closed")
+
+    # Per-sid turn cap (HTTP 429). When the adapter was constructed with a
+    # ``max_turns_per_sid`` ceiling, refuse further /v1/messages calls past
+    # that count so a runaway agent in a sandbox exits cleanly instead of
+    # burning the whole token budget. ``None`` (default) disables.
+    cap = adapter.max_turns_per_sid
+    if cap is not None:
+        prior = adapter._sid_turn_count.get(sid, 0)
+        if prior >= cap:
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": (f"adapter: sid {sid!r} exceeded max_turns_per_sid={cap}; killing run"),
+                    }
+                },
+                status=429,
+            )
+        adapter._sid_turn_count[sid] = prior + 1
+
+    # Strip Claude Code's per-request billing-header sidechannel BEFORE the
+    # adapter renders prompt_ids. Also fold mid-list ``role: system`` messages
+    # into a neighbouring user message so Qwen3 chat templates accept them.
+    # Both are no-ops when the relevant patterns aren't present.
+    _scrub_claude_code_billing_header_in_body(body)
+    _fold_mid_list_system_into_user(body)
+
     app = request.app
     tok = app[TOKENIZER_KEY]
     s = adapter.store.setdefault(sid, Session())
