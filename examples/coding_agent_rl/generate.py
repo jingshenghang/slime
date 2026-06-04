@@ -9,8 +9,9 @@ Wire-up:
     1. ``sandbox.run_claude_code`` prepares the agent sandbox and runs claude-code.
     2. ``sandbox.git_diff`` captures the model-produced patch.
     3. ``sandbox.evaluate`` scores that patch in a second clean sandbox.
-    4. ``_merge_samples`` combines reward + adapter ``TokenSegment``s,
-       delegating segment-to-``Sample`` fan-out to ``slime.agent.trajectory``.
+    4. ``_merge_samples`` combines reward + the ``list[Sample]`` returned by
+       ``adapter.finish_session(sid)`` (which drains the per-sid trajectory
+       tree inside ``TrajectoryManager``).
 
 All sandbox-side details live in ``sandbox.py``; the LLM plumbing
 (Anthropic <-> SGLang /generate, token capture, 3-kind segment split) uses
@@ -138,9 +139,9 @@ class _State(metaclass=SingletonMeta):
 
 # ---------------------------------------------------------------------------
 # Trajectory -> Sample conversion
-# adapter.finish_session() returns TokenSegments. One trajectory yields >=1
-# segments because the agent may compact + reset mid-run; trajectory.py handles
-# the mechanical segment -> Sample fan-out.
+# adapter.finish_session(sid) drains the per-sid tree in TrajectoryManager and
+# returns a list[Sample]. One trajectory yields >=1 samples because the agent
+# may compact + reset mid-run, forking sub-trees that each become a sample.
 # ---------------------------------------------------------------------------
 @dataclass(frozen=True)
 class RewardResult:
@@ -211,9 +212,7 @@ def _merge_samples(
         }
         rlen = int(s.response_length or 0)
         if rlen and s.tokens:
-            s.response = state.tokenizer.decode(
-                s.tokens[-rlen:], skip_special_tokens=False
-            )
+            s.response = state.tokenizer.decode(s.tokens[-rlen:], skip_special_tokens=False)
         else:
             s.response = ""
 

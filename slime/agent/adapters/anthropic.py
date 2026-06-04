@@ -181,24 +181,6 @@ _MID_SYSTEM_WRAP_PREFIX = "<system-reminder>\n"
 _MID_SYSTEM_WRAP_SUFFIX = "\n</system-reminder>\n"
 
 
-def _flatten_anth_text_for_fold(content: Any) -> str:
-    """Best-effort flatten of an Anthropic content value to plain text, used by
-    :func:`_fold_mid_list_system_into_user` when wrapping a folded block."""
-    if content is None:
-        return ""
-    if isinstance(content, str):
-        return content
-    if not isinstance(content, list):
-        return str(content)
-    parts: list[str] = []
-    for b in content:
-        if isinstance(b, dict) and b.get("type") == "text":
-            parts.append(b.get("text", ""))
-        elif isinstance(b, str):
-            parts.append(b)
-    return "\n".join(p for p in parts if p)
-
-
 def _fold_mid_list_system_into_user(body_obj: dict) -> bool:
     """Fold non-leading ``role: system`` messages into a neighbouring user
     message as a ``<system-reminder>`` text block. Mutates ``body_obj`` in
@@ -236,7 +218,7 @@ def _fold_mid_list_system_into_user(body_obj: dict) -> bool:
     TOMBSTONE: dict = {"__folded__": True}
     for i in system_idx:
         sys_msg = msgs[i]
-        wrapped = _wrap(_flatten_anth_text_for_fold(sys_msg.get("content")))
+        wrapped = _wrap(_flatten(sys_msg.get("content")))
         target = None
         for j in range(i - 1, -1, -1):
             cand = msgs[j]
@@ -415,10 +397,8 @@ def _anthropic_tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] 
 # =============================================================================
 # Local chat-template render helper.
 #
-# common.render_token_ids takes an AdapterChain object (OpenAI adapter still
-# uses that path). The Anthropic adapter now renders directly from a message
-# list -- no chain bookkeeping needed because TrajectoryManager is the
-# routing authority.
+# The Anthropic adapter renders directly from a message list -- no chain
+# bookkeeping needed because TrajectoryManager is the routing authority.
 # =============================================================================
 
 
@@ -588,6 +568,9 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
             )
             blocks, stop_reason, response_message = _build_blocks_and_response_message(parsed, turn.finish_reason)
 
+            output_ids = list(turn.output_ids)
+            finish_reason = _finish_reason_for_manager(turn.finish_reason, parsed.tool_uses)
+
             if _is_cc_title_generation_request(translated, tools_schema):
                 # Claude Code meta request (per-session title generation).
                 # Skip the trajectory so it doesn't pollute the tree / become
@@ -606,14 +589,14 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
                         prompt_messages=translated,
                         tools=tools_schema,
                         prompt_ids=prompt_ids,
-                        response_ids=list(turn.output_ids),
+                        response_ids=output_ids,
                         response_logprobs=(
                             list(turn.output_log_probs)
                             if turn.output_log_probs and len(turn.output_log_probs) == len(turn.output_ids)
                             else None
                         ),
                         response_message=response_message,
-                        finish_reason=_finish_reason_for_manager(turn.finish_reason, parsed.tool_uses),
+                        finish_reason=finish_reason,
                         metadata={"sid": sid},
                     )
                 except Exception:
@@ -628,8 +611,8 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
                         tools_schema,
                         response_message,
                         prompt_ids,
-                        list(turn.output_ids),
-                        _finish_reason_for_manager(turn.finish_reason, parsed.tool_uses),
+                        output_ids,
+                        finish_reason,
                     )
                 except Exception:
                     logger.exception("on_turn_appended hook failed (sid=%s)", sid)

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
-import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -13,8 +11,6 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
-
-from slime.agent.trajectory import TokenSegment, TurnRecord
 
 
 ADAPTER_KEY = web.AppKey("adapter", object)
@@ -24,16 +20,21 @@ TOOL_PARSER_KEY = web.AppKey("tool_parser", object)
 REASONING_PARSER_KEY = web.AppKey("reasoning_parser", object)
 
 
-@dataclasses.dataclass
-class AdapterChain:
-    """Protocol-neutral chat chain state used by HTTP adapters."""
+@dataclasses.dataclass(frozen=True)
+class TurnRecord:
+    """Exact token snapshot for one assistant generation, returned by
+    :func:`call_sglang_generate`.
 
-    system_hash: str = ""
-    chat_messages: list[dict] = dataclasses.field(default_factory=list)
-    tools_schema: list[dict] | None = None
-    seen_msgs: int = 0
-    msg_hashes: list[str] = dataclasses.field(default_factory=list)
-    turns: list[TurnRecord] = dataclasses.field(default_factory=list)
+    ``prompt_ids`` is the full tokenized prompt sent to the generator for that
+    turn. ``output_ids`` is the raw generated output, and
+    ``output_log_probs`` is aligned with it when the rollout engine returns
+    per-token log probabilities.
+    """
+
+    prompt_ids: list[int]
+    output_ids: list[int]
+    finish_reason: str
+    output_log_probs: list[float] = dataclasses.field(default_factory=list)
 
 
 class BaseAdapter:
@@ -70,40 +71,8 @@ class BaseAdapter:
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
         await shutdown_session_tasks(sid, self.closed, self.inflight, wait_timeout=wait_timeout)
 
-    async def finish_session(self, sid: str, *, wait_timeout: float = 5.0) -> list[TokenSegment]:
+    async def finish_session(self, sid: str, *, wait_timeout: float = 5.0) -> list:
         raise NotImplementedError
-
-
-def strip_cache_control(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: strip_cache_control(v) for k, v in obj.items() if k != "cache_control"}
-    if isinstance(obj, list):
-        return [strip_cache_control(x) for x in obj]
-    return obj
-
-
-def stable_hash(obj: Any) -> str:
-    payload = json.dumps(strip_cache_control(obj), sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
-    return hashlib.sha1(payload).hexdigest()[:12]
-
-
-def json_arguments(value: Any) -> str:
-    if value is None:
-        return "{}"
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False)
-
-
-def render_token_ids(chain: AdapterChain, tokenizer) -> list[int]:
-    enc = tokenizer.apply_chat_template(
-        chain.chat_messages,
-        tools=chain.tools_schema,
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
-    return list(ids)
 
 
 def request_session_id(
