@@ -257,21 +257,6 @@ def build_app(args: argparse.Namespace) -> web.Application:
         tito_snapshot_min_loss_tokens=args.tito_snapshot_min_loss_tokens,
     )
 
-    # Conditional debug install. When --run-dir is set, middleware_debug
-    # takes over all per-turn / per-session disk dumps via the hook methods
-    # called below. Core middleware never writes to disk on its own.
-    DEBUG = None
-    if args.run_dir:
-        try:
-            from examples.coding_agent_rl import middleware_debug  # type: ignore
-
-            DEBUG = middleware_debug.install(args.run_dir, tok, adapter.manager, args)
-        except Exception:
-            logger.exception(
-                "--run-dir=%s set but middleware_debug install failed; " "running without debug dumps",
-                args.run_dir,
-            )
-
     # Per-sid turn counters so multiple sandboxes sharing :18080 don't
     # interleave debug-file names.
     turn_counters: dict[str, itertools.count] = {}
@@ -280,6 +265,55 @@ def build_app(args: argparse.Namespace) -> web.Application:
     sid_first_user: dict[str, str] = {}
     sid_turn_count: dict[str, int] = {}
     max_turns_per_sid: int = args.max_turns_per_sid
+    # Per-sid dump_dir override (populated via /register_sid). Lets launch_swe
+    # route a sid's turn dumps into its inst_dir instead of run_dir/<sid>/.
+    sid_dump_dir: dict[str, str] = {}
+    # Last turn number observed for each sid, written by dump_mw and read by
+    # the on_turn_appended hook (which is fired from the adapter and has no
+    # access to middleware's _next_turn counter).
+    last_turn: dict[str, int] = {}
+
+    # Conditional debug install. When --run-dir is set, middleware_debug
+    # takes over all per-turn / per-session disk dumps via the hook methods
+    # called below. Core middleware never writes to disk on its own.
+    DEBUG = None
+    if args.run_dir:
+        try:
+            from examples.coding_agent_rl import middleware_debug  # type: ignore
+
+            DEBUG = middleware_debug.install(args.run_dir, tok, adapter.manager, args, sid_dump_dir=sid_dump_dir)
+        except Exception:
+            logger.exception(
+                "--run-dir=%s set but middleware_debug install failed; " "running without debug dumps",
+                args.run_dir,
+            )
+
+    # Bind the per-turn dump hook to the adapter so append_turn payloads land
+    # in turn_NNNN_openai.json. The hook is skipped (None) when DEBUG is off.
+    if DEBUG is not None:
+
+        def _on_turn_appended_hook(
+            sid,
+            prompt_messages,
+            tools,
+            response_message,
+            prompt_ids,
+            response_ids,
+            finish_reason,
+        ):
+            n = last_turn.get(sid, 0)
+            DEBUG.on_turn_appended(
+                sid,
+                n,
+                prompt_messages,
+                tools,
+                response_message,
+                prompt_ids,
+                response_ids,
+                finish_reason,
+            )
+
+        adapter.on_turn_appended = _on_turn_appended_hook
 
     async def _next_turn(sid: str) -> int:
         async with counter_lock:
@@ -353,6 +387,8 @@ def build_app(args: argparse.Namespace) -> web.Application:
 
         body_bytes = await request.read()
         n = await _next_turn(sid)
+        # Stash so the adapter-side on_turn_appended hook can correlate.
+        last_turn[sid] = n
         body_obj: dict | None
         try:
             body_obj = json.loads(body_bytes)
@@ -459,6 +495,33 @@ def build_app(args: argparse.Namespace) -> web.Application:
     adapter.app.router.add_post("/get_trajectory", get_trajectory_route)
     # Backwards-compat alias.
     adapter.app.router.add_post("/finish", get_trajectory_route)
+
+    # -------------------------- /register_sid ---------------------------
+    # Lets launch_swe route this sid's per-turn debug dumps into a specific
+    # absolute directory (the worker's inst_dir) instead of the default
+    # <run_dir>/<sid>/ layout. Idempotent: re-registering overwrites.
+    async def register_sid_route(request: web.Request) -> web.Response:
+        try:
+            body = await request.json()
+        except Exception:
+            return web.json_response({"ok": False, "error": "body must be JSON"}, status=400)
+        sid = body.get("sid")
+        dump_dir = body.get("dump_dir")
+        if not isinstance(sid, str) or not sid:
+            return web.json_response({"ok": False, "error": "missing or non-string 'sid'"}, status=400)
+        if not isinstance(dump_dir, str) or not dump_dir:
+            return web.json_response({"ok": False, "error": "missing or non-string 'dump_dir'"}, status=400)
+        if sid in sid_dump_dir and sid_dump_dir[sid] != dump_dir:
+            logger.warning(
+                "re-register sid=%s dump_dir=%s (was %s)",
+                sid,
+                dump_dir,
+                sid_dump_dir[sid],
+            )
+        sid_dump_dir[sid] = dump_dir
+        return web.json_response({"ok": True})
+
+    adapter.app.router.add_post("/register_sid", register_sid_route)
 
     return adapter.app
 
