@@ -52,8 +52,9 @@ from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any
 
 from slime.utils.types import Sample
 
@@ -101,7 +102,7 @@ class Node:
         role: str | None = None,
         messages: list[dict[str, Any]] | None = None,
         metadata: dict[str, Any] | None = None,
-        parent: "Node | None" = None,
+        parent: Node | None = None,
     ) -> None:
         self.role = role
         self.messages = list(messages or [])
@@ -119,12 +120,12 @@ class Node:
     def is_root(self) -> bool:
         return self.parent is None
 
-    def add_child(self, child: "Node") -> "Node":
+    def add_child(self, child: Node) -> Node:
         child.parent = self
         self.children.append(child)
         return child
 
-    def path_from_root(self) -> list["Node"]:
+    def path_from_root(self) -> list[Node]:
         """Ordered list of nodes from the first non-root ancestor down to self."""
         chain: list[Node] = []
         cur: Node | None = self
@@ -134,7 +135,7 @@ class Node:
         chain.reverse()
         return chain
 
-    def leaves(self) -> Iterator["Node"]:
+    def leaves(self) -> Iterator[Node]:
         if not self.children:
             yield self
             return
@@ -252,8 +253,7 @@ class TrajectoryManager:
             return
         if response_logprobs is not None and len(response_logprobs) != len(response_ids):
             raise ValueError(
-                f"response_logprobs length {len(response_logprobs)} != "
-                f"response_ids length {len(response_ids)}"
+                f"response_logprobs length {len(response_logprobs)} != " f"response_ids length {len(response_ids)}"
             )
 
         root = self._trees.get(sid)
@@ -295,9 +295,7 @@ class TrajectoryManager:
         )
         asst.turn_prompt_ids = list(prompt_ids)
         asst.turn_response_ids = list(response_ids)
-        asst.turn_response_logprobs = (
-            list(response_logprobs) if response_logprobs is not None else None
-        )
+        asst.turn_response_logprobs = list(response_logprobs) if response_logprobs is not None else None
         asst.turn_finish_reason = finish_reason
         asst.turn_index = self._turn_count.get(sid, 0) + 1
         cur.add_child(asst)
@@ -349,7 +347,11 @@ class TrajectoryManager:
         samples: list[Sample] = []
         for leaf in leaves:
             chain = leaf.path_from_root()
-            asst_chain = [n for n in chain if n.role == "assistant"]
+            # Only assistant leaves carrying this turn's sglang snapshot
+            # participate in TITO accumulation. Routing assistant nodes mounted
+            # from prior-turn replay (turn_prompt_ids is None) carry no token
+            # signal and would otherwise be misread as a full-trajectory drift.
+            asst_chain = [n for n in chain if n.role == "assistant" and n.turn_prompt_ids is not None]
 
             tokens: list[int] = []
             loss_mask: list[int] = []
@@ -361,11 +363,7 @@ class TrajectoryManager:
             for k, asst in enumerate(asst_chain, start=1):
                 p = list(asst.turn_prompt_ids or [])
                 r = list(asst.turn_response_ids or [])
-                lp = (
-                    list(asst.turn_response_logprobs)
-                    if asst.turn_response_logprobs is not None
-                    else None
-                )
+                lp = list(asst.turn_response_logprobs) if asst.turn_response_logprobs is not None else None
 
                 if k == 1:
                     emit_prompt = p
@@ -375,25 +373,21 @@ class TrajectoryManager:
                     if drift > 0:
                         drift_loss_tokens = sum(loss_mask[L:])
                         snap_emitted = False
-                        if (
-                            self._snap_threshold is not None
-                            and drift_loss_tokens >= self._snap_threshold
-                        ):
+                        if self._snap_threshold is not None and drift_loss_tokens >= self._snap_threshold:
                             snap_tokens = list(tokens)
                             snap_mask = [0] * L + list(loss_mask[L:])
                             snap_lp = [0.0] * L + [
-                                (logprobs[i] if loss_mask[i] == 1 else 0.0)
-                                for i in range(L, len(tokens))
+                                (logprobs[i] if loss_mask[i] == 1 else 0.0) for i in range(L, len(tokens))
                             ]
-                            snapshots.append(
-                                (snap_tokens, snap_mask, snap_lp, asst.turn_index, k - 1)
-                            )
+                            snapshots.append((snap_tokens, snap_mask, snap_lp, asst.turn_index, k - 1))
                             snap_emitted = True
                         logger.warning(
-                            "get_trajectory(sid=%s leaf turn=%d): TITO drift detected, "
+                            "get_trajectory(sid=%s leaf turn=%s): TITO drift detected, "
                             "dropping %d prior tokens (incl. previous-turn response) to "
                             "realign with this turn's prompt%s",
-                            sid, asst.turn_index, drift,
+                            sid,
+                            asst.turn_index,
+                            drift,
                             f"; snapshotted {drift_loss_tokens} loss tokens" if snap_emitted else "",
                         )
                         if not snap_emitted:
@@ -441,11 +435,7 @@ class TrajectoryManager:
                 samples.append(
                     Sample(
                         index=base_sample.index,
-                        group_id=(
-                            base_sample.group_id
-                            if base_sample.group_id is not None
-                            else base_sample.index
-                        ),
+                        group_id=(base_sample.group_id if base_sample.group_id is not None else base_sample.index),
                         prompt=base_sample.prompt,
                         label=base_sample.label,
                         tokens=snap_tokens,
@@ -471,11 +461,7 @@ class TrajectoryManager:
             samples.append(
                 Sample(
                     index=base_sample.index,
-                    group_id=(
-                        base_sample.group_id
-                        if base_sample.group_id is not None
-                        else base_sample.index
-                    ),
+                    group_id=(base_sample.group_id if base_sample.group_id is not None else base_sample.index),
                     prompt=base_sample.prompt,
                     label=base_sample.label,
                     tokens=tokens,

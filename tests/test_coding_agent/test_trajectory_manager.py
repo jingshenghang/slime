@@ -874,6 +874,120 @@ def test_get_trajectory_tito_snapshot_skipped_when_below_threshold():
 # ---------------------------------------------------------------------------
 
 
+def test_get_trajectory_skips_routing_assistant_in_drift_loop():
+    """A prompt that fuses ``[asst_known, asst_unknown]`` into a single
+    assistant block (because ``_group_messages_by_role`` merges adjacent
+    same-role messages) creates a NEW node_match_key that DFS cannot match
+    against the existing single-message asst leaf. Step-2 then mounts the
+    fused block as a routing-only assistant node — ``turn_prompt_ids`` and
+    ``turn_index`` are both None.
+
+    Without filtering routing nodes out of ``asst_chain``, the drift loop
+    at k>=2 sees ``p=[]``, computes ``drift == len(tokens-so-far) > 0``,
+    and either drops the whole accumulated trajectory or (worse, since the
+    drift is much larger than ``snap_threshold``) snapshots ~0 loss tokens
+    while still emitting the warning with ``turn_index=None`` → TypeError
+    inside ``logger.warning("...leaf turn=%d...")``.
+
+    Regression for the 20260604-120030 batch where 6 instances surfaced
+    routing assistants at depth 23-39, exact pattern: cc replays a prior
+    assistant message that the manager never recorded as its own leaf.
+    """
+    tok = FakeTokenizer()
+    mgr = TrajectoryManager(tokenizer=tok)
+    sid = "routing-asst"
+    sys_msg = {"role": "system", "content": "S"}
+    user1 = {"role": "user", "content": "u1"}
+    asst1 = {"role": "assistant", "content": "real-a1"}
+    tool1 = {"role": "tool", "content": "t1"}
+    asst2 = {"role": "assistant", "content": "real-a2"}
+
+    # turn 1
+    p1 = _render_prompt([sys_msg, user1], tokenizer=tok)
+    r1 = _render_response("real-a1", tokenizer=tok)
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user1],
+        tools=None,
+        prompt_ids=p1,
+        response_ids=r1,
+        response_logprobs=None,
+        response_message=asst1,
+        finish_reason="tool_calls",
+    )
+    # turn 2 — clean continuation
+    p2 = _render_prompt([sys_msg, user1, asst1, tool1], tokenizer=tok)
+    r2 = _render_response("real-a2", tokenizer=tok)
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user1, asst1, tool1],
+        tools=None,
+        prompt_ids=p2,
+        response_ids=r2,
+        response_logprobs=None,
+        response_message=asst2,
+        finish_reason="tool_calls",
+    )
+    # turn 3 — cc replays an extra prior asst that manager never saw via
+    # add_turn. Group-by-role fuses [asst2, foreign] into one assistant
+    # block → DFS can't match the existing single-message asst2 leaf →
+    # step-2 mounts the fused pair as a routing-only assistant.
+    foreign = {"role": "assistant", "content": "foreign-msg"}
+    tool2 = {"role": "tool", "content": "t2"}
+    asst3 = {"role": "assistant", "content": "real-a3"}
+    p3 = _render_prompt([sys_msg, user1, asst1, tool1, asst2, foreign, tool2], tokenizer=tok)
+    r3 = _render_response("real-a3", tokenizer=tok)
+    mgr.append_turn(
+        sid,
+        prompt_messages=[sys_msg, user1, asst1, tool1, asst2, foreign, tool2],
+        tools=None,
+        prompt_ids=p3,
+        response_ids=r3,
+        response_logprobs=None,
+        response_message=asst3,
+        finish_reason="stop",
+    )
+
+    # The asst3 leaf's chain must include a routing assistant carrying
+    # turn_index=None and no turn_prompt_ids.
+    leaf3 = next(
+        leaf for leaf in mgr._trees[sid].leaves() if leaf.messages and leaf.messages[0].get("content") == "real-a3"
+    )
+    chain = leaf3.path_from_root()
+    asst_nodes = [n for n in chain if n.role == "assistant"]
+    routing_asst = [n for n in asst_nodes if n.turn_prompt_ids is None]
+    assert routing_asst, (
+        f"expected a routing assistant in chain; got "
+        f"{[(n.turn_index, n.turn_prompt_ids is not None) for n in asst_nodes]}"
+    )
+    assert routing_asst[0].turn_index is None
+
+    records: list[logging.LogRecord] = []
+
+    class _Cap(logging.Handler):
+        def emit(self, rec):
+            records.append(rec)
+
+    logger_mod = logging.getLogger("slime.agent.trajectory_manager")
+    h = _Cap()
+    logger_mod.addHandler(h)
+    try:
+        samples = mgr.get_trajectory(sid, base_sample=Sample(index=0, prompt=""))
+    finally:
+        logger_mod.removeHandler(h)
+
+    # No spurious drift firing.
+    drift_msgs = [r.getMessage() for r in records if "TITO drift" in r.getMessage()]
+    assert drift_msgs == [], drift_msgs
+    # Every sample's tito_dropped_* must be zero — there's no real drift in
+    # this scenario; only the routing node would synthesize one if leaked in.
+    for s in samples:
+        md = s.metadata or {}
+        assert int(md.get("tito_dropped_turns") or 0) == 0, md
+        assert int(md.get("tito_dropped_tokens") or 0) == 0, md
+    print("PASS test_get_trajectory_skips_routing_assistant_in_drift_loop")
+
+
 def main() -> None:
     test_node_match_key_is_dict_internal_sort_only()
     test_group_messages_by_role_basic()
@@ -898,6 +1012,7 @@ def main() -> None:
     test_drop_clears_sid()
     test_get_trajectory_keep_when_drop_false()
     test_debug_dump_shape()
+    test_get_trajectory_skips_routing_assistant_in_drift_loop()
     print("\nALL PLAN-C TESTS PASSED.")
 
 
