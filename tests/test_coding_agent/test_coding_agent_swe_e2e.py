@@ -115,9 +115,9 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument(
         "--tito-snapshot-min-loss-tokens",
         type=int,
-        default=None,
+        default=1024,
         help="If a TITO drift would drop >= this many loss_mask=1 tokens, "
-        "emit an extra snapshot Sample. None (default) disables.",
+        "emit an extra snapshot Sample. Pass 0 or a negative value to disable.",
     )
     return p.parse_args(argv)
 

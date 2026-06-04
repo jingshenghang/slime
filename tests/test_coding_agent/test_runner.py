@@ -319,10 +319,73 @@ def test_drain_and_dump_sid_writes_tree_trajectory_and_extracts_stats(tmp_path):
                 assert partial["num_samples"] >= 1
                 assert "tito_dropped_tokens" in partial
                 assert "tito_dropped_turns" in partial
+                # Snapshot tracking keys must be present even when no snapshot
+                # was emitted (so write_summary can render zero rows).
+                assert partial["tito_snapshots_count"] == 0
+                assert partial["tito_snapshot_loss_tokens"] == 0
+                assert partial["tito_snapshot_turns"] == []
         finally:
             await upstream_server.close()
 
     asyncio.run(run_case())
+
+
+def test_drain_aggregates_snapshot_metadata_from_samples(tmp_path):
+    """When ``finish_session`` returns Samples whose metadata flags
+    ``tito_snapshot=True``, drain_and_dump_sid must surface them in the
+    partial summary (count + saved-loss-tokens sum + triggered-at-turn list).
+
+    Bypasses the real adapter/upstream by stubbing finish_session and the
+    debug-handle hooks, focusing the test on the aggregation contract.
+    """
+    import asyncio
+
+    from tests.test_coding_agent._runner import drain_and_dump_sid
+
+    class _StubSample:
+        def __init__(self, metadata):
+            self.metadata = metadata
+
+    samples = [
+        _StubSample({"tito_snapshot": True, "tito_snapshot_at_turn": 7, "tito_snapshot_loss_tokens": 300}),
+        _StubSample({"tito_snapshot": True, "tito_snapshot_at_turn": 12, "tito_snapshot_loss_tokens": 800}),
+        _StubSample({"tito_dropped_turns": 3, "tito_dropped_tokens": 4500}),
+    ]
+
+    class _StubAdapter:
+        async def finish_session(self, sid, **kwargs):
+            return samples
+
+        manager = None
+
+    class _StubDebug:
+        def __init__(self):
+            self.sid_dump_dir: dict[str, str] = {}
+
+        def on_drain_start(self, sid, manager):
+            pass
+
+        def on_drain_done(self, sid, samples):
+            pass
+
+    inst_dir = tmp_path / "inst"
+    inst_dir.mkdir()
+    partial = asyncio.run(
+        drain_and_dump_sid(
+            adapter=_StubAdapter(),
+            debug_handle=_StubDebug(),
+            sid="sid-snap",
+            inst_dir=inst_dir,
+            sample={"label": "x"},
+        )
+    )
+
+    assert partial["num_samples"] == 3
+    assert partial["tito_dropped_turns"] == 3
+    assert partial["tito_dropped_tokens"] == 4500
+    assert partial["tito_snapshots_count"] == 2
+    assert partial["tito_snapshot_loss_tokens"] == 1100
+    assert sorted(partial["tito_snapshot_turns"]) == [7, 12]
 
 
 # Sibling fixture imports for the start_adapter_app tests above.

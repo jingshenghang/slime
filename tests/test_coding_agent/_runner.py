@@ -191,7 +191,10 @@ async def start_adapter_app(args, batch_dir: Path, tokenizer):
 
     runner = web.AppRunner(adapter.app)
     await runner.setup()
-    site = web.TCPSite(runner, args.host_ip, args.port)
+    # Bind 0.0.0.0 (not args.host_ip): some hosts expose the dial-back IP via
+    # kube-ipvs0 VIPs that can't be `listen()`-ed directly. Sandboxes still
+    # dial args.host_ip; reachability is verified per-instance.
+    site = web.TCPSite(runner, "0.0.0.0", args.port)
     await site.start()
     # Resolve the OS-assigned port when args.port == 0.
     actual_port = args.port
@@ -274,12 +277,25 @@ async def drain_and_dump_sid(
         "num_samples": len(samples),
         "tito_dropped_tokens": 0,
         "tito_dropped_turns": 0,
+        # Snapshot Sample(s) emitted when a TITO drift would otherwise drop
+        # >= tito_snapshot_min_loss_tokens loss tokens. Each snapshot carries
+        # the dropped suffix as a complementary loss_mask so the tokens still
+        # contribute to training; counted here for summary reporting.
+        "tito_snapshots_count": 0,
+        "tito_snapshot_loss_tokens": 0,
+        "tito_snapshot_turns": [],
         "tree": None,
     }
     for s in samples:
         md = getattr(s, "metadata", None) or {}
         partial["tito_dropped_tokens"] += int(md.get("tito_dropped_tokens", 0) or 0)
         partial["tito_dropped_turns"] += int(md.get("tito_dropped_turns", 0) or 0)
+        if md.get("tito_snapshot"):
+            partial["tito_snapshots_count"] += 1
+            partial["tito_snapshot_loss_tokens"] += int(md.get("tito_snapshot_loss_tokens", 0) or 0)
+            at_turn = md.get("tito_snapshot_at_turn")
+            if at_turn is not None:
+                partial["tito_snapshot_turns"].append(int(at_turn))
 
     tree_json_path = inst_dir / "trajectory_tree.json"
     if tree_json_path.exists():
@@ -596,6 +612,7 @@ async def amain(args) -> int:
                 "tool_parser": args.tool_parser,
                 "reasoning_parser": args.reasoning_parser,
                 "port": args.port,
+                "tito_snapshot_min_loss_tokens": getattr(args, "tito_snapshot_min_loss_tokens", None),
             },
             indent=2,
             default=str,
