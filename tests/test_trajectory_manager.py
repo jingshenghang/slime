@@ -638,6 +638,124 @@ def test_get_trajectory_tito_snapshot_disabled_by_default():
     print("PASS test_get_trajectory_tito_snapshot_disabled_by_default")
 
 
+def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
+    """Drift with loss_mask=1 tokens >= threshold => emit one snapshot Sample
+    plus the regular main-leaf Sample. Snapshot mask is COMPLEMENTARY
+    (1 only at positions [L:] that were originally 1, 0 elsewhere).
+    Main-leaf Sample is bit-for-bit identical to the snapshot-off case."""
+    tok = FakeTokenizer()
+    mgr = TrajectoryManager(tokenizer=tok, tito_snapshot_min_loss_tokens=100)
+
+    sid = "snap-emit"
+    sys_msg = {"role": "system", "content": "S"}
+    user = {"role": "user", "content": "u"}
+    asst1 = {"role": "assistant", "content": "a" * 500}
+    tool = {"role": "tool", "content": "t"}
+    asst2 = {"role": "assistant", "content": "a2"}
+
+    p1 = _render_prompt([sys_msg, user], tokenizer=tok)
+    r1 = _render_response("a" * 500, tokenizer=tok)
+    assert len(r1) > 100
+    mgr.append_turn(
+        sid, prompt_messages=[sys_msg, user], tools=None,
+        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
+        response_message=asst1, finish_reason="tool_calls",
+    )
+    # Splice a fake divergence right at len(p1), so the entire r1 sits in drift.
+    p2_honest = _render_prompt([sys_msg, user, asst1, tool], tokenizer=tok)
+    drift_at = len(p1)
+    p2 = p2_honest[:drift_at] + [77777] + p2_honest[drift_at:]
+    r2 = _render_response("a2", tokenizer=tok)
+    mgr.append_turn(
+        sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
+        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
+        response_message=asst2, finish_reason="stop",
+    )
+
+    samples = mgr.get_trajectory(
+        sid, base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
+        reward=1.0,
+    )
+    assert len(samples) == 2, f"expected 1 snapshot + 1 main, got {len(samples)}"
+    snap, main = samples
+
+    # snapshot
+    assert snap.metadata.get("tito_snapshot") is True
+    assert snap.metadata.get("tito_snapshot_at_turn") == 2
+    assert snap.tokens == p1 + r1
+    assert snap.loss_mask == [0] * len(p1) + [1] * len(r1)
+    assert snap.metadata.get("tito_snapshot_loss_tokens") == len(r1)
+    assert snap.response_length == len(r1)
+    assert snap.rollout_log_probs == [0.0] * len(p1) + [-0.5] * len(r1)
+    assert snap.group_id == 42
+    assert snap.reward == 1.0  # only 1 leaf -> full share
+
+    # main leaf must match the snapshot-OFF baseline
+    mgr_off = TrajectoryManager(tokenizer=tok)
+    sid_off = "snap-off-baseline"
+    mgr_off.append_turn(
+        sid_off, prompt_messages=[sys_msg, user], tools=None,
+        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
+        response_message=asst1, finish_reason="tool_calls",
+    )
+    mgr_off.append_turn(
+        sid_off, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
+        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
+        response_message=asst2, finish_reason="stop",
+    )
+    baseline = mgr_off.get_trajectory(
+        sid_off, base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
+        reward=1.0,
+    )[0]
+    assert main.tokens == baseline.tokens
+    assert main.loss_mask == baseline.loss_mask
+    assert main.rollout_log_probs == baseline.rollout_log_probs
+    # main keeps NO tito_dropped_* for the snapshotted drift
+    assert "tito_dropped_tokens" not in main.metadata
+    assert "tito_dropped_turns" not in main.metadata
+    assert main.metadata.get("tito_snapshots_emitted") == 1
+    print("PASS test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold")
+
+
+def test_get_trajectory_tito_snapshot_skipped_when_below_threshold():
+    """Drift with loss_mask=1 tokens < threshold => no snapshot; old behavior preserved."""
+    tok = FakeTokenizer()
+    mgr = TrajectoryManager(tokenizer=tok, tito_snapshot_min_loss_tokens=10_000)
+
+    sid = "snap-skip"
+    sys_msg = {"role": "system", "content": "S"}
+    user = {"role": "user", "content": "u"}
+    asst1 = {"role": "assistant", "content": "a1"}
+    tool = {"role": "tool", "content": "t"}
+    asst2 = {"role": "assistant", "content": "a2"}
+
+    p1 = _render_prompt([sys_msg, user], tokenizer=tok)
+    r1 = _render_response("a1", tokenizer=tok)
+    mgr.append_turn(
+        sid, prompt_messages=[sys_msg, user], tools=None,
+        prompt_ids=p1, response_ids=r1, response_logprobs=[-0.5] * len(r1),
+        response_message=asst1, finish_reason="tool_calls",
+    )
+    p2_honest = _render_prompt([sys_msg, user, asst1, tool], tokenizer=tok)
+    drift_at = len(p1) + 1
+    p2 = p2_honest[:drift_at] + [77777, 77778, 77779] + p2_honest[drift_at:]
+    r2 = _render_response("a2", tokenizer=tok)
+    mgr.append_turn(
+        sid, prompt_messages=[sys_msg, user, asst1, tool], tools=None,
+        prompt_ids=p2, response_ids=r2, response_logprobs=[-0.4] * len(r2),
+        response_message=asst2, finish_reason="stop",
+    )
+
+    samples = mgr.get_trajectory(sid, base_sample=Sample(index=0, prompt=""), reward=1.0)
+    assert len(samples) == 1, f"below threshold must emit exactly 1 sample, got {len(samples)}"
+    s = samples[0]
+    assert "tito_snapshot" not in s.metadata
+    assert "tito_snapshots_emitted" not in s.metadata
+    assert s.metadata.get("tito_dropped_turns") == 1
+    assert s.metadata.get("tito_dropped_tokens") > 0
+    print("PASS test_get_trajectory_tito_snapshot_skipped_when_below_threshold")
+
+
 # ---------------------------------------------------------------------------
 # main
 # ---------------------------------------------------------------------------
@@ -661,6 +779,8 @@ def main() -> None:
     test_get_trajectory_tito_drift_drops_and_replaces()
     test_get_trajectory_tito_drift_logs_warning()
     test_get_trajectory_tito_snapshot_disabled_by_default()
+    test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold()
+    test_get_trajectory_tito_snapshot_skipped_when_below_threshold()
     test_get_trajectory_two_leaves_share_reward()
     test_drop_clears_sid()
     test_get_trajectory_keep_when_drop_false()

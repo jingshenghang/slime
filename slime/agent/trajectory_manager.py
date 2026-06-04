@@ -27,9 +27,25 @@ Design (Plan C, 2026-06-03):
   later turn — logprobs stay coherent, no duplicated-content forks, no
   reliance on chat_template being position-invariant.
 
+* Snapshot rescue (opt-in via ``tito_snapshot_min_loss_tokens``): when a
+  drift would drop >= N loss_mask=1 tokens, emit an extra "snapshot"
+  Sample alongside the main leaf. Snapshot tokens = cumulative pre-drop;
+  snapshot loss_mask is COMPLEMENTARY — 1 only at positions that the
+  main leaf is about to drop, 0 elsewhere. Snapshot reward = main-leaf
+  share; snapshot group_id = main-leaf group_id. Snapshot ∪ main on
+  loss_mask=1 tokens never overlap and their union equals the virtual
+  no-drift trajectory. The snapshotted drift is NOT counted in the main
+  sample's ``tito_dropped_*`` (it wasn't truly lost).
+
 * On drift, ``Sample.metadata`` records:
-    ``tito_dropped_tokens`` — total tokens dropped across all turns
-    ``tito_dropped_turns``  — number of turns that triggered a drop
+    ``tito_dropped_tokens``       — total tokens dropped (NOT including
+                                    drifts that produced a snapshot)
+    ``tito_dropped_turns``        — number of turns that triggered a drop
+    ``tito_snapshots_emitted``    — set on main leaf when >=1 snapshot
+                                    sibling was emitted for the same leaf
+    ``tito_snapshot``             — True on a snapshot Sample
+    ``tito_snapshot_at_turn``     — turn index whose drift triggered it
+    ``tito_snapshot_loss_tokens`` — count of loss_mask=1 tokens in snapshot
 """
 
 from __future__ import annotations
@@ -316,6 +332,11 @@ class TrajectoryManager:
         across the leaf) and ``tito_dropped_turns`` (how many turns
         triggered a drop). Both keys are absent when no drift occurs.
 
+        When ``tito_snapshot_min_loss_tokens`` was passed to the constructor
+        and a drift would drop >= that many loss_mask=1 tokens, an extra
+        snapshot Sample is emitted before the main-leaf Sample carrying just
+        the to-be-lost tokens (complementary mask). See module docstring.
+
         See module docstring for the rationale.
         """
         if base_sample is None:
@@ -335,6 +356,7 @@ class TrajectoryManager:
             logprobs: list[float] = []
             total_dropped = 0
             dropped_turns = 0
+            snapshots: list[tuple[list[int], list[int], list[float], int, int]] = []
 
             for k, asst in enumerate(asst_chain, start=1):
                 p = list(asst.turn_prompt_ids or [])
@@ -351,14 +373,32 @@ class TrajectoryManager:
                     L = _lcp_len(tokens, p)
                     drift = len(tokens) - L
                     if drift > 0:
+                        drift_loss_tokens = sum(loss_mask[L:])
+                        snap_emitted = False
+                        if (
+                            self._snap_threshold is not None
+                            and drift_loss_tokens >= self._snap_threshold
+                        ):
+                            snap_tokens = list(tokens)
+                            snap_mask = [0] * L + list(loss_mask[L:])
+                            snap_lp = [0.0] * L + [
+                                (logprobs[i] if loss_mask[i] == 1 else 0.0)
+                                for i in range(L, len(tokens))
+                            ]
+                            snapshots.append(
+                                (snap_tokens, snap_mask, snap_lp, asst.turn_index, k - 1)
+                            )
+                            snap_emitted = True
                         logger.warning(
                             "get_trajectory(sid=%s leaf turn=%d): TITO drift detected, "
                             "dropping %d prior tokens (incl. previous-turn response) to "
-                            "realign with this turn's prompt",
+                            "realign with this turn's prompt%s",
                             sid, asst.turn_index, drift,
+                            f"; snapshotted {drift_loss_tokens} loss tokens" if snap_emitted else "",
                         )
-                        total_dropped += drift
-                        dropped_turns += 1
+                        if not snap_emitted:
+                            total_dropped += drift
+                            dropped_turns += 1
                         tokens = tokens[:L]
                         loss_mask = loss_mask[:L]
                         logprobs = logprobs[:L]
@@ -375,19 +415,59 @@ class TrajectoryManager:
                 else:
                     logprobs.extend([0.0] * len(r))
 
-            response_length = sum(1 for m in loss_mask if m == 1)
             last_asst = asst_chain[-1] if asst_chain else None
             first_sys = next((n for n in chain if n.role == "system"), None)
             tools_meta = first_sys.metadata.get("tools") if first_sys else None
-            md: dict[str, Any] = {
+            base_md: dict[str, Any] = {
                 **(base_sample.metadata or {}),
                 **(extra_metadata or {}),
-                "finish_reason": last_asst.turn_finish_reason if last_asst else None,
                 "tools": tools_meta,
             }
+            per_leaf_reward = (reward / len(leaves)) if leaves else 0.0
+
+            # Emit snapshot sample(s) first, then the main-leaf sample.
+            for snap_tokens, snap_mask, snap_lp, drift_turn, cur_chain_idx in snapshots:
+                snap_finish = None
+                prev_idx = cur_chain_idx - 1  # asst_chain index of the previous (prefix's last) turn
+                if 0 <= prev_idx < len(asst_chain):
+                    snap_finish = asst_chain[prev_idx].turn_finish_reason
+                snap_md = {
+                    **base_md,
+                    "finish_reason": snap_finish,
+                    "tito_snapshot": True,
+                    "tito_snapshot_at_turn": drift_turn,
+                    "tito_snapshot_loss_tokens": sum(snap_mask),
+                }
+                samples.append(
+                    Sample(
+                        index=base_sample.index,
+                        group_id=(
+                            base_sample.group_id
+                            if base_sample.group_id is not None
+                            else base_sample.index
+                        ),
+                        prompt=base_sample.prompt,
+                        label=base_sample.label,
+                        tokens=snap_tokens,
+                        response_length=sum(1 for m in snap_mask if m == 1),
+                        loss_mask=snap_mask,
+                        rollout_log_probs=snap_lp,
+                        reward=per_leaf_reward,
+                        status=Sample.Status.COMPLETED,
+                        metadata=snap_md,
+                    )
+                )
+
+            response_length = sum(1 for m in loss_mask if m == 1)
+            main_md: dict[str, Any] = {
+                **base_md,
+                "finish_reason": last_asst.turn_finish_reason if last_asst else None,
+            }
             if total_dropped > 0:
-                md["tito_dropped_tokens"] = total_dropped
-                md["tito_dropped_turns"] = dropped_turns
+                main_md["tito_dropped_tokens"] = total_dropped
+                main_md["tito_dropped_turns"] = dropped_turns
+            if snapshots:
+                main_md["tito_snapshots_emitted"] = len(snapshots)
             samples.append(
                 Sample(
                     index=base_sample.index,
@@ -402,9 +482,9 @@ class TrajectoryManager:
                     response_length=response_length,
                     loss_mask=loss_mask,
                     rollout_log_probs=logprobs,
-                    reward=(reward / len(leaves)) if leaves else 0.0,
+                    reward=per_leaf_reward,
                     status=Sample.Status.COMPLETED,
-                    metadata=md,
+                    metadata=main_md,
                 )
             )
         if drop:
