@@ -151,7 +151,12 @@ def test_anthropic_translation_keeps_tool_results_and_tool_schema():
             "role": "assistant",
             "content": "ok",
             "reasoning_content": "plan",
-            "tool_calls": [{"function": {"name": "lookup", "arguments": {"q": "slime"}}}],
+            "tool_calls": [
+                {
+                    "type": "function",
+                    "function": {"name": "lookup", "arguments": {"q": "slime"}},
+                }
+            ],
         },
         {"role": "tool", "content": "result"},
     ]
@@ -495,6 +500,9 @@ def test_openai_responses_streaming_returns_sse_events_and_records_segments(monk
 
 
 @pytest.mark.unit
+@pytest.mark.skip(
+    reason="legacy TokenSegment/_generate path; AnthropicAdapter now returns list[Sample] via TrajectoryManager — see tests/test_trajectory_manager.py"
+)
 def test_anthropic_messages_endpoint_returns_non_stream_json_and_records_segments(monkeypatch):
     async def fake_generate(prompt_ids, session, body, app, **kwargs):
         return TurnRecord(
@@ -537,6 +545,9 @@ def test_anthropic_messages_endpoint_returns_non_stream_json_and_records_segment
 
 
 @pytest.mark.unit
+@pytest.mark.skip(
+    reason="legacy TokenSegment/_generate path; AnthropicAdapter now returns list[Sample] via TrajectoryManager — see tests/test_trajectory_manager.py"
+)
 def test_anthropic_messages_endpoint_streams_blocks_and_records_segments(monkeypatch):
     async def fake_generate(prompt_ids, session, body, app, **kwargs):
         return TurnRecord(prompt_ids=list(prompt_ids), output_ids=[601], finish_reason="stop", output_log_probs=[-0.6])
@@ -694,6 +705,9 @@ def test_openai_responses_multiturn_uses_sglang_tokens_for_training_segment():
 
 
 @pytest.mark.unit
+@pytest.mark.skip(
+    reason="legacy TokenSegment/_generate path; AnthropicAdapter now returns list[Sample] via TrajectoryManager — see tests/test_trajectory_manager.py"
+)
 def test_anthropic_messages_multiturn_uses_sglang_tokens_for_training_segment():
     async def run_case():
         upstream = FakeSGLang(
@@ -839,6 +853,103 @@ def test_openai_generate_posts_input_ids_and_extracts_logprobs():
         assert turn.output_log_probs == [-0.7, -0.8]
 
     asyncio.run(run_case())
+
+
+# ---------------------------------------------------------------------------
+# _is_cc_title_generation_request — detect cc per-session title-gen requests
+# (spec: docs/superpowers/specs/2026-06-04-skip-cc-title-gen-from-trajectory-design.md)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_is_cc_title_generation_request_detects_title_gen_body():
+    # cc title-gen request: NO tools + system block contains the marker string.
+    translated = [
+        {
+            "role": "system",
+            "content": (
+                "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n"
+                "Generate a concise, sentence-case title (3-7 words) that captures the user's task."
+            ),
+        },
+        {"role": "user", "content": "Read PROBLEM_STATEMENT.md and fix the bug."},
+    ]
+    tools_schema = None  # cc sends tools=[] -> _anthropic_tools_to_chat_tools returns None
+    assert anthropic._is_cc_title_generation_request(translated, tools_schema) is True
+
+
+@pytest.mark.unit
+def test_is_cc_title_generation_request_rejects_main_conversation():
+    # cc main agent request: has tools AND no title-gen marker. Must NOT match.
+    translated = [
+        {
+            "role": "system",
+            "content": (
+                "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n"
+                "You are an interactive agent that helps users with software engineering tasks."
+            ),
+        },
+        {"role": "user", "content": "<system-reminder>...</system-reminder>"},
+    ]
+    tools_schema = [
+        {"type": "function", "function": {"name": "Read", "description": "", "parameters": {}}},
+        {"type": "function", "function": {"name": "Edit", "description": "", "parameters": {}}},
+    ]
+    assert anthropic._is_cc_title_generation_request(translated, tools_schema) is False
+
+
+@pytest.mark.unit
+def test_is_cc_title_generation_request_rejects_subagent():
+    # cc sub-agent request: has tools AND no title-gen marker. Must NOT match.
+    translated = [
+        {
+            "role": "system",
+            "content": (
+                "You are a Claude agent, built on Anthropic's Claude Agent SDK.\n"
+                "You are a file search specialist for Claude Code, Anthropic's official CLI for Claude."
+            ),
+        },
+        {"role": "user", "content": "Find files related to authentication."},
+    ]
+    tools_schema = [
+        {"type": "function", "function": {"name": "Grep", "description": "", "parameters": {}}},
+    ]
+    assert anthropic._is_cc_title_generation_request(translated, tools_schema) is False
+
+
+@pytest.mark.unit
+def test_is_cc_title_generation_request_handles_block_list_system_content():
+    # cc may send system as a list of blocks (anthropic SDK shape).
+    # The marker may live inside one of the blocks; helper must scan all of them.
+    translated = [
+        {
+            "role": "system",
+            "content": [
+                {"type": "text", "text": "x-anthropic-billing-header: cc_version=2.1.143"},
+                {"type": "text", "text": "You are a Claude agent."},
+                {
+                    "type": "text",
+                    "text": "Generate a concise, sentence-case title (3-7 words) ...",
+                },
+            ],
+        },
+        {"role": "user", "content": "hi"},
+    ]
+    assert anthropic._is_cc_title_generation_request(translated, None) is True
+
+
+@pytest.mark.unit
+def test_is_cc_title_generation_request_rejects_when_tools_present_even_if_marker():
+    # AND-conjunction: tools present -> never title-gen, even if marker text leaks in.
+    translated = [
+        {
+            "role": "system",
+            "content": "Generate a concise, sentence-case title (3-7 words) ...",
+        },
+        {"role": "user", "content": "hi"},
+    ]
+    tools_schema = [{"type": "function", "function": {"name": "Read", "description": "", "parameters": {}}}]
+    assert anthropic._is_cc_title_generation_request(translated, tools_schema) is False
 
 
 if __name__ == "__main__":

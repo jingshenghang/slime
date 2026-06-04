@@ -19,6 +19,7 @@ import dataclasses
 import json
 import logging
 import secrets
+from collections.abc import Callable
 from typing import Any
 
 from aiohttp import web
@@ -66,6 +67,7 @@ class AnthropicAdapter(BaseAdapter):
         tool_parser=None,
         reasoning_parser=None,
         tito_snapshot_min_loss_tokens: int | None = None,
+        on_turn_appended: Callable[..., None] | None = None,
     ) -> None:
         super().__init__(
             tokenizer=tokenizer,
@@ -78,6 +80,11 @@ class AnthropicAdapter(BaseAdapter):
             tokenizer=tokenizer,
             tito_snapshot_min_loss_tokens=tito_snapshot_min_loss_tokens,
         )
+        # Optional debug hook invoked after each successful append_turn.
+        # Signature: (sid, prompt_messages, tools, response_message,
+        #             prompt_ids, response_ids, finish_reason) -> None.
+        # Exceptions are swallowed; never block the SSE response.
+        self.on_turn_appended: Callable[..., None] | None = on_turn_appended
         self.app.router.add_post("/v1/messages", _handle_request)
         self.app.router.add_post("/v1/messages/count_tokens", _count_tokens)
         self.app.router.add_get("/healthz", _ok)
@@ -137,6 +144,48 @@ def _flatten(c: Any) -> str:
         elif isinstance(b, str):
             parts.append(b)
     return "\n".join(p for p in parts if p)
+
+
+# Marker string Claude Code embeds in the system prompt of its per-session
+# title-generation request (a meta request that asks the LLM to produce a
+# short conversation title). Title-gen requests should NOT enter the RL
+# trajectory — they aren't agent work. See spec
+# docs/superpowers/specs/2026-06-04-skip-cc-title-gen-from-trajectory-design.md.
+_CC_TITLE_GEN_MARKER = "Generate a concise, sentence-case title"
+
+
+def _is_cc_title_generation_request(
+    translated: list[dict],
+    tools_schema: list[dict] | None,
+) -> bool:
+    """Return True iff this is a Claude Code per-session title-generation request.
+
+    Detection is AND-conjunction:
+      (1) ``tools_schema`` is falsy (cc sends tools=[]; converter returns None).
+      (2) one of the leading ``role=system`` messages' content contains
+          ``_CC_TITLE_GEN_MARKER``.
+
+    Scanning stops at the first non-system message — title-gen system blocks
+    always sit at the head of the request.
+    """
+    if tools_schema:
+        return False
+    for msg in translated:
+        if msg.get("role") != "system":
+            break
+        content = msg.get("content")
+        if isinstance(content, str):
+            if _CC_TITLE_GEN_MARKER in content:
+                return True
+        elif isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and isinstance(block.get("text"), str)
+                    and _CC_TITLE_GEN_MARKER in block["text"]
+                ):
+                    return True
+    return False
 
 
 def _translate_anthropic(msgs: list[dict], system: Any) -> list[dict]:
@@ -378,15 +427,32 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
                     tools=tools_schema,
                     prompt_ids=prompt_ids,
                     response_ids=list(turn.output_ids),
-                    response_logprobs=list(turn.output_log_probs)
-                    if turn.output_log_probs and len(turn.output_log_probs) == len(turn.output_ids)
-                    else None,
+                    response_logprobs=(
+                        list(turn.output_log_probs)
+                        if turn.output_log_probs and len(turn.output_log_probs) == len(turn.output_ids)
+                        else None
+                    ),
                     response_message=response_message,
                     finish_reason=_finish_reason_for_manager(turn.finish_reason, parsed.tool_uses),
                     metadata={"sid": sid},
                 )
             except Exception:
                 logger.exception("append_turn(sid=%s) failed", sid)
+
+            hook = adapter.on_turn_appended
+            if hook is not None:
+                try:
+                    hook(
+                        sid,
+                        translated,
+                        tools_schema,
+                        response_message,
+                        prompt_ids,
+                        list(turn.output_ids),
+                        _finish_reason_for_manager(turn.finish_reason, parsed.tool_uses),
+                    )
+                except Exception:
+                    logger.exception("on_turn_appended hook failed (sid=%s)", sid)
 
             in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
 
