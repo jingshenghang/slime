@@ -381,7 +381,7 @@ def test_on_drain_done_writes_trajectory_json_with_decoded_text(tmp_path):
     # tokens = prompt (0..3) + response (4..6); response_length=3.
     sample = Sample(
         index=0,
-        group_id=0,
+        rollout_id=0,
         prompt="ignored",
         tokens=[100, 101, 102, 103, 200, 201, 202],
         response_length=3,

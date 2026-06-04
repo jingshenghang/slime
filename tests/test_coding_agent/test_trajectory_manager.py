@@ -765,7 +765,7 @@ def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
 
     samples = mgr.get_trajectory(
         sid,
-        base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
+        base_sample=Sample(index=42, rollout_id=42, prompt="P", label="L"),
         reward=1.0,
     )
     assert len(samples) == 2, f"expected 1 snapshot + 1 main, got {len(samples)}"
@@ -779,7 +779,7 @@ def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
     assert snap.metadata.get("tito_snapshot_loss_tokens") == len(r1)
     assert snap.response_length == len(r1)
     assert snap.rollout_log_probs == [0.0] * len(p1) + [-0.5] * len(r1)
-    assert snap.group_id == 42
+    assert snap.rollout_id == 42
     assert snap.reward == 1.0  # only 1 leaf -> full share
 
     # main leaf must match the snapshot-OFF baseline
@@ -807,7 +807,7 @@ def test_get_trajectory_tito_snapshot_emits_when_loss_tokens_above_threshold():
     )
     baseline = mgr_off.get_trajectory(
         sid_off,
-        base_sample=Sample(index=42, group_id=42, prompt="P", label="L"),
+        base_sample=Sample(index=42, rollout_id=42, prompt="P", label="L"),
         reward=1.0,
     )[0]
     assert main.tokens == baseline.tokens
