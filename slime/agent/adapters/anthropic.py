@@ -420,24 +420,36 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
             )
             blocks, stop_reason, response_message = _build_blocks_and_response_message(parsed, turn.finish_reason)
 
-            try:
-                adapter.manager.append_turn(
+            if _is_cc_title_generation_request(translated, tools_schema):
+                # Claude Code meta request (per-session title generation).
+                # Skip the trajectory so it doesn't pollute the tree / become
+                # an RL sample. The on_turn_appended hook below still fires,
+                # so per-turn dumps (request, sse, openai.json) keep landing
+                # on disk for debugging. See spec
+                # docs/superpowers/specs/2026-06-04-skip-cc-title-gen-from-trajectory-design.md.
+                logger.info(
+                    "skipping append_turn for cc title-generation request (sid=%s)",
                     sid,
-                    prompt_messages=translated,
-                    tools=tools_schema,
-                    prompt_ids=prompt_ids,
-                    response_ids=list(turn.output_ids),
-                    response_logprobs=(
-                        list(turn.output_log_probs)
-                        if turn.output_log_probs and len(turn.output_log_probs) == len(turn.output_ids)
-                        else None
-                    ),
-                    response_message=response_message,
-                    finish_reason=_finish_reason_for_manager(turn.finish_reason, parsed.tool_uses),
-                    metadata={"sid": sid},
                 )
-            except Exception:
-                logger.exception("append_turn(sid=%s) failed", sid)
+            else:
+                try:
+                    adapter.manager.append_turn(
+                        sid,
+                        prompt_messages=translated,
+                        tools=tools_schema,
+                        prompt_ids=prompt_ids,
+                        response_ids=list(turn.output_ids),
+                        response_logprobs=(
+                            list(turn.output_log_probs)
+                            if turn.output_log_probs and len(turn.output_log_probs) == len(turn.output_ids)
+                            else None
+                        ),
+                        response_message=response_message,
+                        finish_reason=_finish_reason_for_manager(turn.finish_reason, parsed.tool_uses),
+                        metadata={"sid": sid},
+                    )
+                except Exception:
+                    logger.exception("append_turn(sid=%s) failed", sid)
 
             hook = adapter.on_turn_appended
             if hook is not None:

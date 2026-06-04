@@ -952,5 +952,148 @@ def test_is_cc_title_generation_request_rejects_when_tools_present_even_if_marke
     assert anthropic._is_cc_title_generation_request(translated, tools_schema) is False
 
 
+# ---------------------------------------------------------------------------
+# _handle_request: title-gen requests skip append_turn but still fire hook
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.unit
+def test_anthropic_handle_request_skips_append_turn_for_title_gen(monkeypatch):
+    """A cc title-gen request must NOT enter manager._trees, but the
+    on_turn_appended hook MUST still fire so per-turn dumps (openai.json,
+    etc.) keep being written."""
+
+    async def fake_generate(prompt_ids, session, body, app, **kwargs):
+        return TurnRecord(
+            prompt_ids=list(prompt_ids),
+            output_ids=[42, 43, 44],
+            finish_reason="stop",
+            output_log_probs=[-0.1, -0.2, -0.3],
+        )
+
+    monkeypatch.setattr(anthropic, "call_sglang_generate", fake_generate)
+
+    hook_calls: list[tuple] = []
+
+    def hook(sid, prompt_messages, tools, response_message, prompt_ids, response_ids, finish_reason):
+        hook_calls.append((sid, len(prompt_ids), len(response_ids), finish_reason))
+
+    tok = ToyTokenizer(outputs={(42, 43, 44): '{"title": "Fix the bug"}<|im_end|>'})
+
+    adapter = anthropic.AnthropicAdapter(
+        tokenizer=tok,
+        sglang_url="http://127.0.0.1:1",
+        on_turn_appended=hook,
+    )
+
+    # Build a cc-style title-gen request body.
+    title_gen_body = {
+        "messages": [{"role": "user", "content": "Read PROBLEM_STATEMENT.md and fix."}],
+        "system": [
+            {"type": "text", "text": "You are a Claude agent."},
+            {
+                "type": "text",
+                "text": "Generate a concise, sentence-case title (3-7 words) ...",
+            },
+        ],
+        "tools": [],
+        "max_tokens": 512,
+        "stream": False,
+    }
+
+    async def run():
+        app = adapter.app
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r = await client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer test-title-gen-sid"},
+                json=title_gen_body,
+            )
+            assert r.status == 200, await r.text()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+    # The manager MUST NOT have learned about this sid (no tree was opened).
+    assert (
+        "test-title-gen-sid" not in adapter.manager._trees
+    ), f"title-gen request leaked into manager: trees={list(adapter.manager._trees)}"
+
+    # The hook MUST have fired exactly once with this sid.
+    assert len(hook_calls) == 1, f"expected 1 hook call, got {hook_calls}"
+    assert hook_calls[0][0] == "test-title-gen-sid"
+    assert hook_calls[0][2] == 3  # response_ids length matches fake_generate output
+
+
+@pytest.mark.unit
+def test_anthropic_handle_request_still_appends_main_conversation(monkeypatch):
+    """Sanity counter-test: a normal (non-title-gen) request MUST still
+    populate manager._trees and fire the hook. Prevents an over-broad guard
+    from silently dropping real conversation turns."""
+
+    async def fake_generate(prompt_ids, session, body, app, **kwargs):
+        return TurnRecord(
+            prompt_ids=list(prompt_ids),
+            output_ids=[7, 8, 9],
+            finish_reason="stop",
+            output_log_probs=[-0.1, -0.2, -0.3],
+        )
+
+    monkeypatch.setattr(anthropic, "call_sglang_generate", fake_generate)
+
+    hook_calls: list[tuple] = []
+
+    def hook(sid, *rest):
+        hook_calls.append(sid)
+
+    tok = ToyTokenizer(outputs={(7, 8, 9): "hello"})
+
+    adapter = anthropic.AnthropicAdapter(
+        tokenizer=tok,
+        sglang_url="http://127.0.0.1:1",
+        on_turn_appended=hook,
+    )
+
+    main_body = {
+        "messages": [{"role": "user", "content": "Run the tests."}],
+        "system": [
+            {"type": "text", "text": "You are an interactive agent."},
+        ],
+        "tools": [
+            {
+                "name": "Read",
+                "description": "Read a file",
+                "input_schema": {"type": "object", "properties": {}},
+            }
+        ],
+        "max_tokens": 8000,
+        "stream": False,
+    }
+
+    async def run():
+        app = adapter.app
+        client = TestClient(TestServer(app))
+        await client.start_server()
+        try:
+            r = await client.post(
+                "/v1/messages",
+                headers={"Authorization": "Bearer test-main-sid"},
+                json=main_body,
+            )
+            assert r.status == 200, await r.text()
+        finally:
+            await client.close()
+
+    asyncio.run(run())
+
+    assert (
+        "test-main-sid" in adapter.manager._trees
+    ), f"main conversation did NOT reach manager: trees={list(adapter.manager._trees)}"
+    assert hook_calls == ["test-main-sid"], hook_calls
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))
