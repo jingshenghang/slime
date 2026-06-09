@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
-import hashlib
-import json
 import logging
 import uuid
 from collections.abc import Callable
@@ -13,8 +11,6 @@ from typing import Any
 
 import aiohttp
 from aiohttp import web
-
-from slime.agent.trajectory import TokenSegment, TurnRecord
 
 
 ADAPTER_KEY = web.AppKey("adapter", object)
@@ -24,24 +20,23 @@ TOOL_PARSER_KEY = web.AppKey("tool_parser", object)
 REASONING_PARSER_KEY = web.AppKey("reasoning_parser", object)
 
 
-@dataclasses.dataclass
-class AdapterChain:
-    """Protocol-neutral chat chain state used by HTTP adapters."""
-
-    system_hash: str = ""
-    chat_messages: list[dict] = dataclasses.field(default_factory=list)
-    tools_schema: list[dict] | None = None
-    seen_msgs: int = 0
-    msg_hashes: list[str] = dataclasses.field(default_factory=list)
-    turns: list[TurnRecord] = dataclasses.field(default_factory=list)
+@dataclasses.dataclass(frozen=True)
+class TurnRecord:
+    prompt_ids: list[int]
+    output_ids: list[int]
+    finish_reason: str
+    output_log_probs: list[float] = dataclasses.field(default_factory=list)
 
 
 class BaseAdapter:
     """Base HTTP adapter with per-instance session lifecycle state."""
 
     session_cls: type
+    # Set by subclass __init__: the shared TrajectoryManager keyed by sid.
+    manager: Any
 
     def __init__(self, *, tokenizer, sglang_url, tool_parser=None, reasoning_parser=None) -> None:
+        self.tokenizer = tokenizer
         self.store: dict[str, Any] = {}
         self.inflight: dict[str, set[asyncio.Task]] = {}
         self.closed: set[str] = set()
@@ -70,40 +65,39 @@ class BaseAdapter:
     async def shutdown_session(self, sid: str, *, wait_timeout: float = 5.0) -> None:
         await shutdown_session_tasks(sid, self.closed, self.inflight, wait_timeout=wait_timeout)
 
-    async def finish_session(self, sid: str, *, wait_timeout: float = 5.0) -> list[TokenSegment]:
-        raise NotImplementedError
+    async def finish_session(
+        self,
+        sid: str,
+        *,
+        base_sample=None,
+        reward: float = 0.0,
+        extra_metadata: dict | None = None,
+        wait_timeout: float = 5.0,
+    ) -> list:
+        """Drain a session's trajectory into fully-formed Sample objects.
 
-
-def strip_cache_control(obj: Any) -> Any:
-    if isinstance(obj, dict):
-        return {k: strip_cache_control(v) for k, v in obj.items() if k != "cache_control"}
-    if isinstance(obj, list):
-        return [strip_cache_control(x) for x in obj]
-    return obj
-
-
-def stable_hash(obj: Any) -> str:
-    payload = json.dumps(strip_cache_control(obj), sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
-    return hashlib.sha1(payload).hexdigest()[:12]
-
-
-def json_arguments(value: Any) -> str:
-    if value is None:
-        return "{}"
-    if isinstance(value, str):
-        return value
-    return json.dumps(value, ensure_ascii=False)
-
-
-def render_token_ids(chain: AdapterChain, tokenizer) -> list[int]:
-    enc = tokenizer.apply_chat_template(
-        chain.chat_messages,
-        tools=chain.tools_schema,
-        tokenize=True,
-        add_generation_prompt=True,
-    )
-    ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
-    return list(ids)
+        Waits out in-flight requests for ``sid``, linearises the per-sid tree
+        via ``TrajectoryManager.get_trajectory``, then decodes each sample's
+        trained tail into ``.response`` (the manager is tokenizer-free, so the
+        adapter that owns the tokenizer fills this in). Idempotent -- a second
+        call for an already-popped sid returns ``[]``.
+        """
+        await self.shutdown_session(sid, wait_timeout=wait_timeout)
+        # Drop the per-sid adapter Session; the trajectory itself lives in the
+        # manager's per-sid tree and is popped by get_trajectory(drop=True).
+        self.store.pop(sid, None)
+        samples = self.manager.get_trajectory(
+            sid,
+            base_sample=base_sample,
+            reward=reward,
+            extra_metadata=extra_metadata,
+        )
+        for s in samples:
+            rlen = int(s.response_length or 0)
+            s.response = (
+                self.tokenizer.decode(s.tokens[-rlen:], skip_special_tokens=False) if rlen and s.tokens else ""
+            )
+        return samples
 
 
 def request_session_id(

@@ -9,8 +9,8 @@ Wire-up:
     1. ``sandbox.run_claude_code`` prepares the agent sandbox and runs claude-code.
     2. ``sandbox.git_diff`` captures the model-produced patch.
     3. ``sandbox.evaluate`` scores that patch in a second clean sandbox.
-    4. ``_merge_samples`` combines reward + adapter ``TokenSegment``s,
-       delegating segment-to-``Sample`` fan-out to ``slime.agent.trajectory``.
+    4. ``adapter.finish_session`` drains the session tree into reward-weighted
+       ``Sample`` objects with ``.response`` already decoded; ``generate`` logs.
 
 All sandbox-side details live in ``sandbox.py``; the LLM plumbing
 (Anthropic <-> SGLang /generate, token capture, 3-kind segment split) uses
@@ -49,17 +49,15 @@ import os
 import secrets
 import time
 import traceback
-from dataclasses import dataclass
 from typing import Any
 
 from slime.agent.adapters import AnthropicAdapter
-from slime.agent.trajectory import TokenSegment, fan_out_sample_segments
 from slime.utils.misc import SingletonMeta
 from slime.utils.processing_utils import load_tokenizer
 from slime.utils.types import Sample
 
 from . import sandbox
-from .aiohttp_threaded import run_app_in_thread
+from .aiohttp_threaded import FilteredAccessLogger, run_app_in_thread
 
 logger = logging.getLogger(__name__)
 
@@ -97,11 +95,13 @@ class _State(metaclass=SingletonMeta):
                 "Without it the sandbox cannot dial back and the rollout will "
                 "silently abort."
             )
+        fork_merge_threshold = int(v) if (v := os.environ.get("SLIME_FORK_MERGE_MAX_RESPONSE_TOKENS")) else None
         self.adapter = AnthropicAdapter(
             tokenizer=self.tokenizer,
             sglang_url=sglang_url,
             tool_parser=self.tool_parser,
             reasoning_parser=self.reasoning_parser,
+            fork_threshold_tokens=fork_merge_threshold,
         )
         # handler_cancellation=True so a client disconnect cancels the handler
         # coroutine, arming the fire-and-forget /abort_request inside the
@@ -113,7 +113,10 @@ class _State(metaclass=SingletonMeta):
             host=SHIM_BIND_HOST,
             port=SHIM_PORT,
             thread_name="anthropic-adapter",
-            runner_kwargs={"handler_cancellation": True},
+            runner_kwargs={
+                "handler_cancellation": True,
+                "access_log_class": FilteredAccessLogger,
+            },
         )
         self.adapter_url = f"http://{public_host}:{self.app_handle.port}"
         logger.info(
@@ -127,18 +130,8 @@ class _State(metaclass=SingletonMeta):
 
 
 # ---------------------------------------------------------------------------
-# Trajectory -> Sample conversion
-# adapter.finish_session() returns TokenSegments. One trajectory yields >=1
-# segments because the agent may compact + reset mid-run; trajectory.py handles
-# the mechanical segment -> Sample fan-out.
+# Session setup
 # ---------------------------------------------------------------------------
-@dataclass(frozen=True)
-class RewardResult:
-    reward: float
-    is_solved: bool
-    applied_cleanly: bool
-
-
 def _start_session(
     state: _State,
     sample: Sample,
@@ -164,55 +157,11 @@ def _start_session(
     return session_id
 
 
-def _merge_samples(
-    *,
-    sample: Sample,
-    state: _State,
-    segments: list[TokenSegment],
-    reward_result: RewardResult,
-    elapsed_sec: float,
-    instance_id: str,
-):
-    if not segments:
-        return _abort_result(sample, "adapter_session_empty")
-
-    trajectory_metadata = {
-        **(sample.metadata or {}),
-        "instance_id": instance_id,
-        "is_solved": reward_result.is_solved,
-        "applied_cleanly": reward_result.applied_cleanly,
-        "elapsed_sec": elapsed_sec,
-    }
-
-    # All K samples share rollout_id so the loss reducer counts this
-    # trajectory once.
-    fanned = fan_out_sample_segments(
-        sample,
-        segments,
-        reward_result.reward,
-        state.tokenizer,
-        metadata=trajectory_metadata,
-    )
-    if not fanned:
-        raise ValueError("fan-out produced no samples")
-
-    logger.info(
-        "[coding_agent_rl] %s: reward=%.2f solved=%s applied=%s elapsed=%.1fs segments=%d",
-        instance_id,
-        reward_result.reward,
-        reward_result.is_solved,
-        reward_result.applied_cleanly,
-        elapsed_sec,
-        len(fanned),
-    )
-    return fanned
-
-
 # ---------------------------------------------------------------------------
 # Main per-sample agent function
 #
 # The four calls inside the timeout are the high-level rollout recipe:
-# run_claude_code -> git_diff -> sandbox.evaluate -> merge_samples.
+# run_claude_code -> git_diff -> sandbox.evaluate -> finish_session.
 # ---------------------------------------------------------------------------
 async def generate(args, sample: Sample, sampling_params: dict[str, Any]):
     """Per-sample agent function with wall-clock guard. See
@@ -249,20 +198,26 @@ async def generate(args, sample: Sample, sampling_params: dict[str, Any]):
                 pre_commands=md["pre_commands"],
                 timeout_sec=SWE_EVAL_TIMEOUT_SEC,
             )
-            reward_result = RewardResult(
+            samples = await state.adapter.finish_session(
+                session_id,
+                base_sample=sample,
                 reward=float(reward),
-                is_solved=bool(is_solved),
-                applied_cleanly=bool(applied_cleanly),
             )
-            segments = await state.adapter.finish_session(session_id)
-            return _merge_samples(
-                sample=sample,
-                state=state,
-                segments=segments,
-                reward_result=reward_result,
-                elapsed_sec=time.time() - t0,
-                instance_id=instance_id,
+            if not samples:
+                return _abort_result(sample, "adapter_session_empty")
+
+            # finish_session already linearized, reward-weighted and decoded
+            # each segment's .response; here we only log a summary.
+            logger.info(
+                "[coding_agent_rl] %s: reward=%.2f solved=%s applied=%s elapsed=%.1fs segments=%d",
+                instance_id,
+                float(reward),
+                bool(is_solved),
+                bool(applied_cleanly),
+                time.time() - t0,
+                len(samples),
             )
+            return samples
 
     except asyncio.TimeoutError:
         _log_timeout_diagnostic(t0)

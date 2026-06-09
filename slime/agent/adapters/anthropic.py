@@ -2,13 +2,14 @@
 
 The adapter exposes ``/v1/messages`` and ``/v1/messages/count_tokens``. It
 renders each Anthropic message history with the served model's chat template,
-calls SGLang ``/generate`` with ``input_ids``, and records the exact sampled
-token ids/logprobs as ``TurnRecord`` objects. New code should use
-``AnthropicAdapter`` and call ``finish_session()`` at trajectory end to drain
-trainable ``TokenSegment`` objects.
+calls SGLang ``/generate`` with ``input_ids``, and feeds the turn into a
+shared :class:`~slime.agent.trajectory_manager.TrajectoryManager` keyed by
+session id. ``finish_session(sid)`` drains a session's trajectory into a list
+of :class:`~slime.utils.types.Sample`.
 
-It also handles Claude Code sub-agent and compaction patterns by splitting one
-session into ``subagent``, ``wipe``, and ``final`` segments.
+The per-sid tree inside TrajectoryManager handles sub-agent and compaction
+patterns automatically (any divergence in the prompt prefix forks into a new
+leaf), so we no longer track ``main`` / ``active_sub`` chains here.
 """
 
 from __future__ import annotations
@@ -18,39 +19,38 @@ import dataclasses
 import json
 import logging
 import secrets
+from collections.abc import Callable
 from typing import Any
 
 from aiohttp import web
 
-from slime.agent.adapters.common import ADAPTER_KEY, REASONING_PARSER_KEY, TOKENIZER_KEY, TOOL_PARSER_KEY
-from slime.agent.adapters.common import AdapterChain as Chain
 from slime.agent.adapters.common import (
+    ADAPTER_KEY,
+    REASONING_PARSER_KEY,
+    TOKENIZER_KEY,
+    TOOL_PARSER_KEY,
     BaseAdapter,
     call_sglang_generate,
     ok_response,
-    render_token_ids,
     request_session_id,
 )
-from slime.agent.adapters.common import stable_hash as _hash
-from slime.agent.parsing import parse_model_output
-from slime.agent.trajectory import TokenSegment, TurnRecord, TurnSegment, make_turn_segment, merge_turn_segments
+from slime.agent.parsing import ParsedModelOutput, parse_model_output
+from slime.agent.trajectory_manager import TrajectoryManager
 
 logger = logging.getLogger(__name__)
 
 
-# Tool names claude-code uses to dispatch a sub-agent.
-_SUBAGENT_TOOLS = {"Task", "Agent"}
-
-
 @dataclasses.dataclass
 class Session:
-    main: Chain = dataclasses.field(default_factory=Chain)
-    active_sub: Chain | None = None  # at most one sub-agent at a time
-    pending_dispatch_id: str = ""  # tool_use_id we're waiting to close
+    """Per-sid adapter state: sampling defaults, context budget, request lock.
+
+    Trajectory state lives in ``AnthropicAdapter.manager`` (one shared
+    TrajectoryManager keyed by sid across all sessions).
+    """
+
     sampling_defaults: dict = dataclasses.field(default_factory=dict)
     max_context_tokens: int = 0
     lock: asyncio.Lock = dataclasses.field(default_factory=asyncio.Lock)
-    segments: list[TurnSegment] = dataclasses.field(default_factory=list)  # frozen output
 
 
 class AnthropicAdapter(BaseAdapter):
@@ -58,101 +58,117 @@ class AnthropicAdapter(BaseAdapter):
 
     session_cls = Session
 
-    def __init__(self, *, tokenizer, sglang_url, tool_parser=None, reasoning_parser=None) -> None:
+    def __init__(
+        self,
+        *,
+        tokenizer,
+        sglang_url,
+        tool_parser=None,
+        reasoning_parser=None,
+        max_turns_per_sid: int | None = None,
+        fork_threshold_tokens: int | None = None,
+        on_turn_appended: Callable[..., None] | None = None,
+    ) -> None:
         super().__init__(
             tokenizer=tokenizer,
             sglang_url=sglang_url,
             tool_parser=tool_parser,
             reasoning_parser=reasoning_parser,
         )
+        # ONE manager shared across all sids; per-sid trees live inside.
+        # ``None`` means "caller did not specify" -> let TrajectoryManager use
+        # its own default for the assistant-rewrite merge threshold.
+        mgr_kwargs: dict[str, int] = {}
+        if fork_threshold_tokens is not None:
+            mgr_kwargs["fork_threshold_tokens"] = fork_threshold_tokens
+        self.manager = TrajectoryManager(**mgr_kwargs)
+        # Optional debug hook invoked after each successful append_turn.
+        # Signature: (sid, prompt_messages, tools, response_message,
+        #             prompt_ids, response_ids, finish_reason) -> None.
+        # Exceptions are swallowed; never block the SSE response.
+        self.on_turn_appended: Callable[..., None] | None = on_turn_appended
+        # Per-sid turn cap; None disables. When set, /v1/messages returns 429
+        # once a sid has made this many turns. Prevents runaway agents from
+        # burning the whole budget.
+        self.max_turns_per_sid: int | None = max_turns_per_sid
+        self._sid_turn_count: dict[str, int] = {}
         self.app.router.add_post("/v1/messages", _handle_request)
         self.app.router.add_post("/v1/messages/count_tokens", _count_tokens)
         self.app.router.add_get("/healthz", _ok)
         self.app.router.add_get("/v1/models", _ok)
 
-    async def finish_session(self, sid: str, *, wait_timeout: float = 5.0) -> list[TokenSegment]:
-        await self.shutdown_session(sid, wait_timeout=wait_timeout)
-        s = self.store.pop(sid, None)
-        if s is None:
-            return []
-        if s.active_sub is not None and s.active_sub.turns:
-            s.segments.append(make_turn_segment(s.active_sub.turns, kind="subagent"))
-        if s.main.turns:
-            s.segments.append(make_turn_segment(s.main.turns, kind="final"))
-
-        return merge_turn_segments(s.segments)
-
 
 # =============================================================================
-# 2. Per-turn stages
+# Translation (Anthropic wire <-> chat-template messages)
 # =============================================================================
 
 
-def _select_chain(s: Session, body: dict) -> tuple[Chain, bool, str]:
-    """Decide which chain this turn operates on.
+_MID_SYSTEM_WRAP_PREFIX = "<system-reminder>\n"
+_MID_SYSTEM_WRAP_SUFFIX = "\n</system-reminder>\n"
 
-    1. fingerprint body.messages and body.system into hashes
-    2. if main now contains the tool_result for a pending sub dispatch,
-       snapshot the sub chain into s.segments and clear s.active_sub
-    3. pick main vs s.active_sub based on whether request continues main's prefix
-    4. classify as 'new' | 'append' | 'wipe' against the chosen target;
-       a wipe also snapshots the target's current state into s.segments
 
-    Returns (target_chain, is_sub, kind).
+def _fold_mid_list_system_into_user(body_obj: dict) -> bool:
+    """Fold non-leading ``role: system`` messages into a neighbouring user
+    message as a ``<system-reminder>`` text block. Mutates ``body_obj`` in
+    place; returns True iff any fold happened.
+
+    Claude Code CLI >= 2.1.161 inserts ``{"role":"system","content":"<skills
+    list>"}`` in the middle of ``messages``. Qwen3-style chat templates reject
+    any system message past index 0 with ``System message must be at the
+    beginning.`` This wrap mirrors the older claude-code (<= 2.1.143)
+    behaviour by attaching the wrapped reminder to the preceding user message
+    (or the next one if no prior user message exists).
     """
-    all_msgs = body.get("messages") or []
-    msg_hashes = [_hash(m) for m in all_msgs]
-    req_system_hash = _hash(body.get("system")) if "system" in body else s.main.system_hash
+    msgs = body_obj.get("messages")
+    if not isinstance(msgs, list) or not msgs:
+        return False
 
-    # Close active sub-agent if its dispatch tool_result has landed on main.
-    if s.pending_dispatch_id and s.active_sub is not None:
-        tu_id = s.pending_dispatch_id
-        for m in all_msgs:
-            if not isinstance(m, dict) or m.get("role") != "user":
-                continue
-            content = m.get("content")
-            if not isinstance(content, list):
-                continue
-            done = any(
-                isinstance(b, dict) and b.get("type") == "tool_result" and b.get("tool_use_id") == tu_id
-                for b in content
-            )
-            if done:
-                if s.active_sub.turns:
-                    s.segments.append(make_turn_segment(s.active_sub.turns, kind="subagent"))
-                s.active_sub = None
-                s.pending_dispatch_id = ""
+    system_idx = [i for i, m in enumerate(msgs) if isinstance(m, dict) and m.get("role") == "system" and i > 0]
+    if not system_idx:
+        return False
+
+    def _promote_to_list(msg: dict) -> list:
+        c = msg.get("content")
+        if isinstance(c, list):
+            return c
+        msg["content"] = [{"type": "text", "text": c if isinstance(c, str) else ""}]
+        return msg["content"]
+
+    def _wrap(text: str) -> dict:
+        return {
+            "type": "text",
+            "text": _MID_SYSTEM_WRAP_PREFIX + text + _MID_SYSTEM_WRAP_SUFFIX,
+        }
+
+    changed = False
+    TOMBSTONE: dict = {"__folded__": True}
+    for i in system_idx:
+        sys_msg = msgs[i]
+        wrapped = _wrap(_flatten(sys_msg.get("content")))
+        target = None
+        for j in range(i - 1, -1, -1):
+            cand = msgs[j]
+            if isinstance(cand, dict) and cand.get("role") == "user":
+                target = cand
+                _promote_to_list(target).append(wrapped)
                 break
+        if target is None:
+            for j in range(i + 1, len(msgs)):
+                cand = msgs[j]
+                if isinstance(cand, dict) and cand.get("role") == "user":
+                    target = cand
+                    _promote_to_list(target).insert(0, wrapped)
+                    break
+        if target is None:
+            msgs[i] = {"role": "user", "content": [wrapped]}
+            changed = True
+            continue
+        msgs[i] = TOMBSTONE
+        changed = True
 
-    # Route: main iff request continues main's prefix. Sub system_hash can be
-    # "" (armed before sub dialled in), so never route by sub equality alone.
-    if s.active_sub is None:
-        target, is_sub = s.main, False
-    else:
-        main_continues = (
-            req_system_hash == s.main.system_hash
-            and len(msg_hashes) >= s.main.seen_msgs
-            and msg_hashes[: s.main.seen_msgs] == s.main.msg_hashes[: s.main.seen_msgs]
-        )
-        target, is_sub = (s.main, False) if main_continues else (s.active_sub, True)
-
-    # Classify; snapshot a "wipe" segment first if we're discarding work.
-    if target.seen_msgs == 0:
-        kind = "new"
-    else:
-        is_append = (
-            req_system_hash == target.system_hash
-            and len(msg_hashes) >= target.seen_msgs
-            and msg_hashes[: target.seen_msgs] == target.msg_hashes[: target.seen_msgs]
-        )
-        if is_append:
-            kind = "append"
-        else:
-            if target.turns:
-                s.segments.append(make_turn_segment(target.turns, kind="wipe"))
-            kind = "wipe"
-
-    return target, is_sub, kind
+    if changed:
+        body_obj["messages"] = [m for m in msgs if m is not TOMBSTONE]
+    return changed
 
 
 def _flatten(c: Any) -> str:
@@ -177,6 +193,48 @@ def _flatten(c: Any) -> str:
         elif isinstance(b, str):
             parts.append(b)
     return "\n".join(p for p in parts if p)
+
+
+# Marker string Claude Code embeds in the system prompt of its per-session
+# title-generation request (a meta request that asks the LLM to produce a
+# short conversation title). Title-gen requests should NOT enter the RL
+# trajectory — they aren't agent work. See spec
+# docs/superpowers/specs/2026-06-04-skip-cc-title-gen-from-trajectory-design.md.
+_CC_TITLE_GEN_MARKER = "Generate a concise, sentence-case title"
+
+
+def _is_cc_title_generation_request(
+    translated: list[dict],
+    tools_schema: list[dict] | None,
+) -> bool:
+    """Return True iff this is a Claude Code per-session title-generation request.
+
+    Detection is AND-conjunction:
+      (1) ``tools_schema`` is falsy (cc sends tools=[]; converter returns None).
+      (2) one of the leading ``role=system`` messages' content contains
+          ``_CC_TITLE_GEN_MARKER``.
+
+    Scanning stops at the first non-system message — title-gen system blocks
+    always sit at the head of the request.
+    """
+    if tools_schema:
+        return False
+    for msg in translated:
+        if msg.get("role") != "system":
+            break
+        content = msg.get("content")
+        if isinstance(content, str):
+            if _CC_TITLE_GEN_MARKER in content:
+                return True
+        elif isinstance(content, list):
+            for block in content:
+                if (
+                    isinstance(block, dict)
+                    and isinstance(block.get("text"), str)
+                    and _CC_TITLE_GEN_MARKER in block["text"]
+                ):
+                    return True
+    return False
 
 
 def _translate_anthropic(msgs: list[dict], system: Any) -> list[dict]:
@@ -208,7 +266,28 @@ def _translate_anthropic(msgs: list[dict], system: Any) -> list[dict]:
                 elif b.get("type") == "thinking":
                     thinkings.append(b.get("thinking", ""))
                 elif b.get("type") == "tool_use":
-                    tcs.append({"function": {"name": b.get("name", "tool"), "arguments": b.get("input") or {}}})
+                    # Match the canonical shape produced by
+                    # _build_blocks_and_response_message for sampled leaves so
+                    # that node_match_key (json.dumps sort_keys) hashes a
+                    # replayed assistant identically to its leaf. We drop the
+                    # wire-only "id" — see the matching note on the leaf side.
+                    # NB: arguments stays a dict here (NOT a JSON string).
+                    # The translated list is also fed to the chat template
+                    # via apply_chat_template; Qwen3's template calls
+                    # `arguments | items` which requires a mapping. A JSON
+                    # string would raise "Can only get item pairs from a
+                    # mapping." mid-render. node_match_key's json.dumps
+                    # sort_keys=True recursively sorts dict keys so two
+                    # equivalent dicts still hash identically.
+                    tcs.append(
+                        {
+                            "type": "function",
+                            "function": {
+                                "name": b.get("name", "tool"),
+                                "arguments": b.get("input") or {},
+                            },
+                        }
+                    )
             mo: dict[str, Any] = {"role": "assistant", "content": "".join(texts)}
             if thinkings:
                 mo["reasoning_content"] = "".join(thinkings)
@@ -241,120 +320,108 @@ def _anthropic_tools_to_chat_tools(anth_tools: list[dict] | None) -> list[dict] 
     return ts or None
 
 
-def _replace_chat_messages(target: Chain, body: dict) -> None:
-    """new/wipe: full reset of chat state and turn log."""
-    all_msgs = body.get("messages") or []
-    target.chat_messages = _translate_anthropic(all_msgs, body.get("system"))
-    if "system" in body:
-        target.system_hash = _hash(body.get("system"))
-    target.turns.clear()
-    target.seen_msgs = len(all_msgs)
-    target.msg_hashes = [_hash(m) for m in all_msgs]
-    if target.tools_schema is None:
-        target.tools_schema = _anthropic_tools_to_chat_tools(body.get("tools"))
+# =============================================================================
+# Local chat-template render helper.
+#
+# The Anthropic adapter renders directly from a message list -- no chain
+# bookkeeping needed because TrajectoryManager is the routing authority.
+# =============================================================================
 
 
-def _extend_chat_messages(target: Chain, body: dict) -> None:
-    """append: translate only the new tail."""
-    all_msgs = body.get("messages") or []
-    translated = _translate_anthropic(all_msgs[target.seen_msgs :], None)
-    target.chat_messages.extend(translated)
-
-    target.seen_msgs = len(all_msgs)
-    target.msg_hashes = [_hash(m) for m in all_msgs]
-    if target.tools_schema is None:
-        target.tools_schema = _anthropic_tools_to_chat_tools(body.get("tools"))
-
-
-def _build_prompt(target: Chain, body: dict, kind: str, tok) -> list[int]:
-    """Replace/extend chat_messages and render input ids for sglang."""
-    (_extend_chat_messages if kind == "append" else _replace_chat_messages)(target, body)
-    return render_token_ids(target, tok)
-
-
-async def _generate(
-    prompt_ids: list[int], s: Session, body: dict, app, *, session_id: str | None = None
-) -> TurnRecord:
-    """Call sglang and return a TurnRecord.
-
-    1. build sampling_params (session defaults overlaid with body overrides)
-    2. POST sglang /generate; on cancel/error fire /abort_request
-    3. keep the exact prompt/output token ids; trajectory merge later compares
-       later prompt tokens with earlier outputs to build the loss mask
-    """
-    return await call_sglang_generate(
-        prompt_ids,
-        s,
-        body,
-        app,
-        max_token_keys=("max_tokens",),
-        stop_keys=("stop_sequences",),
-        log_prefix="anthropic_adapter",
-        logger=logger,
-        session_id=session_id,
+def _render_token_ids(
+    messages: list[dict],
+    tokenizer,
+    *,
+    tools: list[dict] | None,
+    add_generation_prompt: bool = True,
+) -> list[int]:
+    enc = tokenizer.apply_chat_template(
+        messages,
+        tools=tools,
+        tokenize=True,
+        add_generation_prompt=add_generation_prompt,
     )
-
-
-def _build_reply(target: Chain, output_ids: list[int], finish: str, app) -> tuple[list[dict], str, str]:
-    """Turn the model's raw output ids into the reply we send back to claude-code.
-
-    1. parse decoded text -> (thinking, visible, tool_uses) via sglang parsers
-    2. pack into Anthropic content blocks; tag dispatch_id when a tool_use
-       names Task/Agent (sub-agent trigger)
-    3. derive stop_reason: 'tool_use' | 'max_tokens' | 'end_turn'
-
-    Returns (blocks, stop_reason, dispatch_id).
-    """
-    tok = app[TOKENIZER_KEY]
-
-    raw_output = tok.decode(output_ids, skip_special_tokens=False) if output_ids else ""
-    parsed = parse_model_output(
-        raw_output,
-        tools_schema=target.tools_schema,
-        tool_parser_name=app[TOOL_PARSER_KEY],
-        reasoning_parser_name=app[REASONING_PARSER_KEY],
-    )
-    blocks, dispatch_id = _anthropic_blocks(parsed.reasoning, parsed.text, parsed.tool_uses)
-    return blocks, _stop_reason(parsed.tool_uses, finish), dispatch_id
-
-
-def _anthropic_blocks(thinking: str, visible: str, tool_uses: list[dict]) -> tuple[list[dict], str]:
-    """Pack parsed model output into Anthropic content blocks."""
-    blocks: list[dict] = []
-    if thinking:
-        blocks.append({"type": "thinking", "thinking": thinking})
-    if visible:
-        blocks.append({"type": "text", "text": visible})
-    dispatch_id = ""
-    for tu in tool_uses:
-        tu_id = f"toolu_{secrets.token_hex(8)}"
-        blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]})
-        if tu["name"] in _SUBAGENT_TOOLS:
-            dispatch_id = tu_id
-    if not blocks:
-        blocks.append({"type": "text", "text": ""})
-    return blocks, dispatch_id
-
-
-def _stop_reason(tool_uses: list[dict], finish: str) -> str:
-    if tool_uses:
-        return "tool_use"
-    if finish == "length":
-        return "max_tokens"
-    return "end_turn"
-
-
-def _start_sub_chain(s: Session, dispatch_id: str) -> None:
-    """Start a fresh sub chain on this session and remember the tool_use_id
-    we'll watch for on main to know when this sub is done. The matching
-    'sub done' step lives inside _select_chain."""
-    s.pending_dispatch_id = dispatch_id
-    if s.active_sub is None:
-        s.active_sub = Chain()
+    ids = enc["input_ids"] if hasattr(enc, "__getitem__") and "input_ids" in enc else enc
+    return list(ids)
 
 
 # =============================================================================
-# 3. Request handling -- one full turn + SSE wrap
+# Reply building: parsed output -> Anthropic blocks + OpenAI-shape response_message
+# =============================================================================
+
+
+def _build_blocks_and_response_message(
+    parsed: ParsedModelOutput,
+    finish: str,
+) -> tuple[list[dict], str, dict[str, Any]]:
+    """Pack parsed model output into:
+      - Anthropic content blocks (sent over the wire),
+      - stop_reason,
+      - response_message (OpenAI shape) for TrajectoryManager.append_turn.
+
+    The tool_calls inside response_message use canonical JSON args (sorted
+    keys, str-encoded) so the node_match_key the manager computes for this
+    assistant turn matches the same turn replayed as history on the next
+    /v1/messages request.
+    """
+    blocks: list[dict] = []
+    if parsed.reasoning:
+        blocks.append({"type": "thinking", "thinking": parsed.reasoning})
+    if parsed.text:
+        blocks.append({"type": "text", "text": parsed.text})
+
+    response_tcs: list[dict] = []
+    for tu in parsed.tool_uses:
+        tu_id = f"toolu_{secrets.token_hex(8)}"
+        blocks.append({"type": "tool_use", "id": tu_id, "name": tu["name"], "input": tu["input"]})
+        # NB: do NOT include tu_id here. The id is wire-only (clients use it
+        # to correlate tool_result blocks). When cc echoes this assistant on
+        # the next /v1/messages, it sends the original id; slime regenerates
+        # a fresh id each call. Including the id in response_message would
+        # make node_match_key differ between leaf and echo, breaking the
+        # leaf-vs-replay merge — see trajectory_manager DFS Step 1.
+        #
+        # arguments stays a dict to mirror _translate_anthropic. The
+        # trajectory_manager node_match_key uses json.dumps(sort_keys=True)
+        # which is invariant to dict key order, so two equivalent dicts
+        # hash identically.
+        response_tcs.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": tu["name"],
+                    "arguments": tu.get("input") or {},
+                },
+            }
+        )
+
+    if not blocks:
+        blocks.append({"type": "text", "text": ""})
+
+    if parsed.tool_uses:
+        stop_reason = "tool_use"
+    elif finish == "length":
+        stop_reason = "max_tokens"
+    else:
+        stop_reason = "end_turn"
+
+    response_message: dict[str, Any] = {"role": "assistant", "content": parsed.text or ""}
+    if parsed.reasoning:
+        response_message["reasoning_content"] = parsed.reasoning
+    if response_tcs:
+        response_message["tool_calls"] = response_tcs
+
+    return blocks, stop_reason, response_message
+
+
+def _finish_reason_for_manager(finish: str, tool_uses: list[dict]) -> str:
+    if tool_uses:
+        return "tool_calls"
+    return finish or "stop"
+
+
+# =============================================================================
+# Request handling -- one full turn + SSE wrap
 # =============================================================================
 
 
@@ -368,23 +435,108 @@ async def _handle_request(request: web.Request) -> web.StreamResponse:
     adapter = request.app[ADAPTER_KEY]
     if sid in adapter.closed:  # session drained; refuse stragglers
         return web.Response(status=503, text="session closed")
+
+    # Per-sid turn cap (HTTP 429). When the adapter was constructed with a
+    # ``max_turns_per_sid`` ceiling, refuse further /v1/messages calls past
+    # that count so a runaway agent in a sandbox exits cleanly instead of
+    # burning the whole token budget. ``None`` (default) disables.
+    cap = adapter.max_turns_per_sid
+    if cap is not None:
+        prior = adapter._sid_turn_count.get(sid, 0)
+        if prior >= cap:
+            return web.json_response(
+                {
+                    "error": {
+                        "type": "rate_limit_error",
+                        "message": (f"adapter: sid {sid!r} exceeded max_turns_per_sid={cap}; killing run"),
+                    }
+                },
+                status=429,
+            )
+        adapter._sid_turn_count[sid] = prior + 1
+
+    _fold_mid_list_system_into_user(body)
+
     app = request.app
+    tok = app[TOKENIZER_KEY]
     s = adapter.store.setdefault(sid, Session())
     task = asyncio.current_task()
     adapter.inflight.setdefault(sid, set()).add(task)
     try:
         async with s.lock:  # same sid -> serialized
-            target, is_sub, kind = _select_chain(s, body)
-            ideal_ids = _build_prompt(target, body, kind, app[TOKENIZER_KEY])
-            turn = await _generate(ideal_ids, s, body, app, session_id=sid)
-            blocks, stop, did = _build_reply(target, turn.output_ids, turn.finish_reason, app)
-            target.turns.append(turn)
-            if did and not is_sub:  # sub doesn't nest
-                _start_sub_chain(s, did)
-            in_tok, out_tok = len(ideal_ids), len(turn.output_ids)
+            translated = _translate_anthropic(body.get("messages") or [], body.get("system"))
+            tools_schema = _anthropic_tools_to_chat_tools(body.get("tools"))
+            prompt_ids = _render_token_ids(translated, tok, tools=tools_schema, add_generation_prompt=True)
+
+            turn = await call_sglang_generate(
+                prompt_ids,
+                s,
+                body,
+                app,
+                max_token_keys=("max_tokens",),
+                stop_keys=("stop_sequences",),
+                log_prefix="anthropic_adapter",
+                logger=logger,
+                session_id=sid,
+            )
+
+            raw_output = tok.decode(turn.output_ids, skip_special_tokens=False) if turn.output_ids else ""
+            parsed = parse_model_output(
+                raw_output,
+                tools_schema=tools_schema,
+                tool_parser_name=app[TOOL_PARSER_KEY],
+                reasoning_parser_name=app[REASONING_PARSER_KEY],
+            )
+            blocks, stop_reason, response_message = _build_blocks_and_response_message(parsed, turn.finish_reason)
+
+            finish_reason = _finish_reason_for_manager(turn.finish_reason, parsed.tool_uses)
+            turn = dataclasses.replace(turn, finish_reason=finish_reason)
+            output_ids = list(turn.output_ids)
+
+            if _is_cc_title_generation_request(translated, tools_schema):
+                # Claude Code meta request (per-session title generation).
+                # Skip the trajectory so it doesn't pollute the tree / become
+                # an RL sample. The on_turn_appended hook below still fires,
+                # so per-turn dumps (request, sse, openai.json) keep landing
+                # on disk for debugging. See spec
+                # docs/superpowers/specs/2026-06-04-skip-cc-title-gen-from-trajectory-design.md.
+                logger.info(
+                    "skipping append_turn for cc title-generation request (sid=%s)",
+                    sid,
+                )
+            else:
+                try:
+                    adapter.manager.append_turn(
+                        sid,
+                        turn=turn,
+                        prompt_messages=translated,
+                        tools=tools_schema,
+                        response_message=response_message,
+                        metadata={"sid": sid},
+                    )
+                except Exception:
+                    logger.exception("append_turn(sid=%s) failed", sid)
+
+            hook = adapter.on_turn_appended
+            if hook is not None:
+                try:
+                    hook(
+                        sid,
+                        translated,
+                        tools_schema,
+                        response_message,
+                        prompt_ids,
+                        output_ids,
+                        finish_reason,
+                    )
+                except Exception:
+                    logger.exception("on_turn_appended hook failed (sid=%s)", sid)
+
+            in_tok, out_tok = len(prompt_ids), len(turn.output_ids)
+
         if body.get("stream") is True or "text/event-stream" in request.headers.get("Accept", ""):
-            return await _stream_response(request, blocks, stop, in_tok, out_tok)
-        return web.json_response(_message_response(body, blocks, stop, in_tok, out_tok))
+            return await _stream_response(request, blocks, stop_reason, in_tok, out_tok)
+        return web.json_response(_message_response(body, blocks, stop_reason, in_tok, out_tok))
     finally:
         adapter.inflight.get(sid, set()).discard(task)
 
@@ -416,7 +568,6 @@ async def _stream_response(request, blocks, stop_reason, in_tok, out_tok) -> web
     )
     await out.prepare(request)
 
-    # message_start
     ms_data = {
         "type": "message_start",
         "message": {
