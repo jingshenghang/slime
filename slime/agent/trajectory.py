@@ -19,6 +19,17 @@ from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
+# Prefix Claude Code injects as the first user message of a post-compaction
+# request (context ran out -> history replaced by a summary). Used as the
+# content signal for ``is_compact_start`` (see ``_classify_segment``).
+COMPACT_SUMMARY_PREFIX = "This session is being continued from a previous conversation"
+
+# Tool-call names that spawn a sub-agent with a fresh context. The wire records
+# the sub-agent's task text under ``input.prompt``; the manager sees it again as
+# the first user message of the sub-agent's own segment, which is how a sub-agent
+# is linked back to its caller (see ``_build_agent_prompt_index``).
+SUBAGENT_TOOL_NAMES = ("Agent", "Task")
+
 
 # ===========================================================================
 # TurnRecord
@@ -76,6 +87,11 @@ class MessageNode:
         self.children: list[MessageNode] = []
         self.turn: TurnRecord | None = None  # the generated TurnRecord, else None (routing-only)
         self.turn_index: int | None = None
+        # Per-sid monotonic id assigned at mount time to EVERY node (routing-only
+        # and generated alike). Stable within one sid; reused as the unit a
+        # Sample's ``identity.node_list`` references and a sub-agent's
+        # ``caller_node_ids`` points at. The dummy root keeps ``None``.
+        self.node_id: int | None = None
         # Shared by sibling leaf paths; the first to reach it trains on it, the rest
         # re-emit it as loss_mask=0 context -- so each response is trained exactly once.
         self.response_trained: bool = False
@@ -164,6 +180,11 @@ class _SampleBuilder:
         self.logprobs: list[float] = []
         self.last_response_start_idx: int | None = None
         self.leading_prompt_len: int = 0
+        # Generated assistant nodes packed into this builder, in append order.
+        # "Include = record": a node re-emitted as loss=0 context (claimed by an
+        # earlier sibling leaf) is still listed here, so ``node_list`` reflects
+        # what this Sample spans; reverse lookup picks the trainer (loss=1).
+        self.nodes: list[MessageNode] = []
 
     def classify_token_drift(self, turn: TurnRecord) -> DriftKind:
         """Decide how this builder should absorb ``turn``'s prompt.
@@ -212,6 +233,10 @@ class _SampleBuilder:
         if is_first_turn:
             self.leading_prompt_len = len(turn.prompt_ids)
 
+    def add_node(self, node: MessageNode) -> None:
+        """Record the generated node whose turn was just appended (for node_list)."""
+        self.nodes.append(node)
+
     def _align_to_prompt(self, prompt_ids: list[int]) -> None:
         """Heal REALIGN drift by overwriting the most-recent response span with
         ``prompt_ids`` as loss_mask=0: the drifted tokens carry no signal, and re-appending
@@ -230,10 +255,34 @@ class _SampleBuilder:
     def has_trained_response(self) -> bool:
         return any(self.loss_mask[self.leading_prompt_len :])
 
+    def _identity_metadata(self) -> dict[str, Any]:
+        """Build this Sample's ``identity`` block from the generated nodes it spans.
+
+        The origin / compact / caller facts were resolved once per segment in
+        ``_classify_segments`` and stamped onto each generated node's
+        ``identity_segment``; here we just read the start node's segment and list
+        the node ids this builder packed. A builder always begins at a segment
+        start (a fork opens a fresh builder), so ``nodes[0]`` carries the
+        authoritative identity for the whole Sample.
+        """
+        start = self.nodes[0]
+        seg = start.metadata.get("identity_segment", {})
+        return {
+            "origin": seg.get("origin", "main"),
+            "is_compact_start": bool(seg.get("is_compact_start", False)),
+            "node_list": [n.node_id for n in self.nodes],
+            "start_node_id": start.node_id,
+            "caller_node_ids": list(seg.get("caller_node_ids", [])),
+            "match_kind": seg.get("match_kind"),
+        }
+
     def to_sample(self, base_sample: Sample, extra_metadata: dict[str, Any] | None) -> Sample:
         """Emit the accumulated tokens as one ``Sample``, stripping the first-turn
         prompt so loss_mask / logprobs cover only the response region."""
         start = self.leading_prompt_len  # first-turn prompt stripped; response region starts here
+        metadata = dict(extra_metadata or {})
+        if self.nodes:
+            metadata["identity"] = self._identity_metadata()
         return Sample(
             index=base_sample.index,
             group_index=base_sample.group_index,
@@ -246,7 +295,7 @@ class _SampleBuilder:
             rollout_log_probs=self.logprobs[start:],
             reward=0.0,
             status=Sample.Status.COMPLETED,
-            metadata=dict(extra_metadata or {}),
+            metadata=metadata,
         )
 
 
@@ -260,6 +309,7 @@ class TrajectoryManager:
         self._fork_threshold: int = 1024 if fork_threshold_tokens is None else fork_threshold_tokens
         self._trees: dict[str, MessageNode] = {}
         self._turn_count: dict[str, int] = {}
+        self._node_count: dict[str, int] = {}  # per-sid monotonic node_id allocator
 
     # -------------------- public ------------------------------------------
 
@@ -290,7 +340,7 @@ class TrajectoryManager:
 
         node, depth = self._find_mount_point(root, prompt_messages)
         node, depth = self._try_merge_assistant_rewrite(sid, node, prompt_messages, depth)
-        node = self._mount_prompt_messages(node, prompt_messages[depth:])
+        node = self._mount_prompt_messages(node, prompt_messages[depth:], sid=sid)
         self._attach_assistant_leaf(sid, node, turn=turn, response_message=response_message, metadata=metadata)
 
     def get_trajectory(
@@ -312,6 +362,11 @@ class TrajectoryManager:
         if root is None:
             return []
 
+        # Resolve per-segment identity (main / sub_agent / compact-start + caller)
+        # onto the generated nodes before draining, so each emitted Sample can read
+        # its start node's identity. Pure annotation -- never affects routing.
+        self._classify_segments(root)
+
         samples: list[Sample] = []
         for routing_leaf in root.leaves():
             if routing_leaf.is_root:
@@ -326,6 +381,7 @@ class TrajectoryManager:
 
         self._trees.pop(sid, None)
         self._turn_count.pop(sid, None)
+        self._node_count.pop(sid, None)
         return samples
 
     # -------------------- internals ----------------------------------------
@@ -406,13 +462,23 @@ class TrajectoryManager:
         rewritten_node.message = prompt_messages[depth]
         return rewritten_node, depth + 1
 
+    def _next_node_id(self, sid: str) -> int:
+        """Allocate the next per-sid node_id (monotonic from 0)."""
+        nid = self._node_count.get(sid, 0)
+        self._node_count[sid] = nid + 1
+        return nid
+
     def _mount_prompt_messages(
         self,
         node: MessageNode,
         remaining_messages: list[dict[str, Any]],
+        *,
+        sid: str,
     ) -> MessageNode:
         for m in remaining_messages:
-            node = node.add_child(MessageNode(role=m.get("role"), message=m))
+            child = MessageNode(role=m.get("role"), message=m)
+            child.node_id = self._next_node_id(sid)
+            node = node.add_child(child)
         return node
 
     def _attach_assistant_leaf(
@@ -429,6 +495,7 @@ class TrajectoryManager:
             message=response_message,
             metadata=dict(metadata or {}),
         )
+        asst.node_id = self._next_node_id(sid)
         asst.turn = turn
         asst.turn_index = self._turn_count.get(sid, 0) + 1
         node.add_child(asst)
@@ -455,6 +522,7 @@ class TrajectoryManager:
                 builders[-1].append_turn(asst_node.turn, DriftKind.CLEAN, trained=trained)
             else:
                 builders[-1].append_turn(asst_node.turn, kind, trained=trained)
+            builders[-1].add_node(asst_node)
         return builders
 
     def _chain_to_samples(
@@ -469,6 +537,173 @@ class TrajectoryManager:
             for builder in self._split_chain_into_builders(chain)
             if builder.has_trained_response()
         ]
+
+    # -------------------- identity (segment classification) ----------------
+
+    def _classify_segments(self, root: MessageNode) -> None:
+        """Stamp each generated assistant node with its identity.
+
+        Identity has three orthogonal facets, each from a distinct content signal
+        (the manager never sees SDK markers like ``parent_tool_use_id`` -- only the
+        translated prompt messages), resolved per generated node:
+
+        * **origin** (``main`` / ``sub_agent``) -- from the SYSTEM prompt. The main
+          agent keeps one system prompt for the whole run; a sub-agent re-roots with
+          its own (e.g. an Explore specialist prompt). A node whose leading system
+          content differs from the main agent's (the earliest generated turn's) is
+          a sub-agent. This is the only origin signal that survives a compaction,
+          which severs the token path back to the sub-agent's first turn.
+        * **is_compact_start** -- True iff a user message opening this node's turn
+          starts with ``COMPACT_SUMMARY_PREFIX`` (context ran out, history replaced
+          by a summary). Per-node, not propagated: only the genuine post-compact
+          restart turn is a compact start, not later turns.
+        * **caller_node_ids** / **match_kind** -- for sub-agents, the node(s) whose
+          ``Agent``/``Task`` tool call spawned this run, matched by prompt text. The
+          spawning turn's first user message equals the agent-call prompt; later
+          turns inherit the caller from their nearest generated ancestor (so a
+          drift-fork mid-run keeps the link). A compaction breaks that path, so a
+          post-compact sub-agent turn keeps ``origin=sub_agent`` but loses the
+          caller (empty list).
+
+        Pure annotation written under ``metadata['identity_segment']``; the routing
+        tree is untouched. Nodes are visited parent-before-child (pre-order) so
+        caller inheritance can read an already-resolved ancestor.
+        """
+        gens = self._generated_nodes(root)  # pre-order: parents before children
+        if not gens:
+            return
+        prompt_index = self._build_agent_prompt_index(gens)
+        main_system = self._system_content(min(gens, key=lambda n: n.turn_index or 0))
+
+        for gen in gens:
+            origin = "sub_agent" if self._system_content(gen) != main_system else "main"
+            is_compact_start = False
+            own_callers: list[int] | None = None
+            own_kind: str | None = None
+            for text in self._lead_in_user_texts(gen):
+                if text.startswith(COMPACT_SUMMARY_PREFIX):
+                    is_compact_start = True
+                    continue
+                callers, kind = self._match_agent_prompt(text, prompt_index)
+                if callers is not None:
+                    own_callers, own_kind = callers, kind
+
+            caller_node_ids: list[int] = []
+            match_kind: str | None = None
+            if origin == "sub_agent":
+                if own_callers is not None:
+                    caller_node_ids, match_kind = own_callers, own_kind
+                else:  # inherit the caller from the nearest generated ancestor
+                    parent_seg = self._parent_gen_segment(gen)
+                    if parent_seg and parent_seg.get("origin") == "sub_agent":
+                        caller_node_ids = list(parent_seg.get("caller_node_ids", []))
+                        match_kind = parent_seg.get("match_kind")
+
+            gen.metadata["identity_segment"] = {
+                "origin": origin,
+                "is_compact_start": is_compact_start,
+                "caller_node_ids": caller_node_ids,
+                "match_kind": match_kind,
+            }
+
+    @staticmethod
+    def _generated_nodes(root: MessageNode) -> list[MessageNode]:
+        """All generated assistant nodes (turn set) under root, pre-order."""
+        out: list[MessageNode] = []
+        stack = list(reversed(root.children))
+        while stack:
+            n = stack.pop()
+            if n.role == "assistant" and n.turn is not None:
+                out.append(n)
+            stack.extend(reversed(n.children))
+        return out
+
+    @staticmethod
+    def _system_content(node: MessageNode) -> str:
+        """Leading system-message content on ``node``'s path (``""`` if none)."""
+        for n in node.path_from_root():
+            if n.role == "system":
+                content = (n.message or {}).get("content")
+                return content if isinstance(content, str) else ""
+        return ""
+
+    @staticmethod
+    def _parent_gen_segment(gen: MessageNode) -> dict[str, Any] | None:
+        """``identity_segment`` of the nearest generated ancestor, if resolved."""
+        node = gen.parent
+        while node is not None and not node.is_root:
+            if node.role == "assistant" and node.turn is not None:
+                return node.metadata.get("identity_segment")
+            node = node.parent
+        return None
+
+    def _build_agent_prompt_index(self, gens: list[MessageNode]) -> dict[str, list[int]]:
+        """Map each prior agent-call prompt text -> the node_ids that issued it.
+
+        Scans every generated assistant node's ``message['tool_calls']`` for
+        ``Agent``/``Task`` calls and indexes their ``arguments['prompt']``. A
+        prompt may map to several caller node_ids (parallel fan-out reuses the
+        same prompt, or one node issues several agent calls), so the value is a
+        list -- the full candidate set, deduped, in node_id order.
+        """
+        index: dict[str, list[int]] = {}
+        for node in gens:
+            msg = node.message or {}
+            for tc in msg.get("tool_calls") or []:
+                fn = tc.get("function") if isinstance(tc, dict) else None
+                if not isinstance(fn, dict) or fn.get("name") not in SUBAGENT_TOOL_NAMES:
+                    continue
+                args = fn.get("arguments")
+                prompt = args.get("prompt") if isinstance(args, dict) else None
+                if not isinstance(prompt, str) or not prompt:
+                    continue
+                callers = index.setdefault(prompt, [])
+                if node.node_id not in callers:
+                    callers.append(node.node_id)
+        return index
+
+    @staticmethod
+    def _lead_in_user_texts(gen: MessageNode) -> list[str]:
+        """User-message texts between ``gen`` and the previous generated node.
+
+        These routing-only user nodes are what opened ``gen``'s turn -- the
+        compaction summary or the sub-agent task prompt land here. Walks up from
+        ``gen`` collecting user contents until it hits another generated assistant
+        (the previous turn's tail) or the root.
+        """
+        texts: list[str] = []
+        node = gen.parent
+        while node is not None and not node.is_root:
+            if node.role == "assistant" and node.turn is not None:
+                break
+            if node.role == "user":
+                content = (node.message or {}).get("content")
+                if isinstance(content, str) and content:
+                    texts.append(content)
+            node = node.parent
+        return texts
+
+    @staticmethod
+    def _match_agent_prompt(text: str, prompt_index: dict[str, list[int]]) -> tuple[list[int] | None, str | None]:
+        """Match a lead-in user text against the agent-call prompt index.
+
+        Exact (byte-equal) match wins and is reported as ``"exact"``. Failing
+        that, a relaxed pass tolerates whitespace drift and prefix wrapping (cc
+        prepends a ``<system-reminder>`` block or trims trailing space): the
+        index prompt is accepted if it equals the text after stripping, or the
+        text starts with / contains the stripped prompt. Relaxed hits report
+        ``"approx"``. Returns ``(None, None)`` when nothing matches.
+        """
+        if text in prompt_index:
+            return list(prompt_index[text]), "exact"
+        stripped = text.strip()
+        for prompt, callers in prompt_index.items():
+            p = prompt.strip()
+            if not p:
+                continue
+            if stripped == p or stripped.startswith(p) or p in stripped:
+                return list(callers), "approx"
+        return None, None
 
 
 __all__ = [
