@@ -24,7 +24,7 @@ class ClaudeCodeHarness(BaseHarness):
     launch_flags = (
         "--permission-mode bypassPermissions "
         "--output-format stream-json --include-partial-messages "
-        "--include-hook-events --verbose"
+        "--include-hook-events --verbose -p"
     )
 
     static_env = {
@@ -55,7 +55,7 @@ class ClaudeCodeHarness(BaseHarness):
         )
 
     async def launch_and_wait(self, sb: Sandbox, ctx: HarnessContext, prompt: str, time_budget_sec: int) -> int:
-        cmd = f"/usr/local/bin/claude -p {shlex.quote(prompt)} {self.launch_flags}"
+        cmd = f"/usr/local/bin/claude {self.launch_flags} {shlex.quote(prompt)}"
         extra = os.environ.get(self.extra_args_env, "").strip()
         if extra:
             cmd = f"{cmd} {extra}"
